@@ -1,0 +1,255 @@
+# paperclerk configuration. docs/design.md explains the reasoning behind each setting.
+# Relative paths are relative to this file. Secrets can also come from environment variables:
+# PAPERLESS_URL, PAPERLESS_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD.
+
+# Local state database, stored mail attachments, OCR data and log
+data_dir = "data"
+
+[paperless]
+url = "http://localhost:8000"
+# Profile -> API auth token
+token = ""
+# Added to every document paperclerk has enriched. `paperclerk process` skips documents that carry
+# it; remove it in Paperless to have a document processed again.
+processed_tag = "paperclerk"
+timeout = 120
+verify_tls = true
+
+[ollama]
+url = "http://localhost:11434"
+keep_alive = "30m"
+# Seconds per request; 27B models with CPU offload are slow
+timeout = 1800
+
+[enrich]
+# Metadata extraction, shared by `import` and `process`. Changing the model recomputes suggestions that
+# are not yet written to Paperless. "qwen3.6:35b" (MoE) was ~5x faster but needs ~23 GB of free RAM.
+model = "qwen3.8"
+num_ctx = 8192
+# false, or a thinking level such as "low" (thinking costs a lot of time)
+think = false
+# Characters of document text sent to the model
+max_chars = 7000
+# Language of titles, new tags and summaries
+language = "German"
+# Add a short summary as a Paperless note
+summary = true
+# Document types the model may choose in addition to those already in Paperless (created on first use)
+document_types = ["Rechnung", "Quittung", "Bestellung", "Vertrag", "Versicherung", "Kontoauszug", "Bescheid", "Gehaltsabrechnung", "Gesundheit", "Ticket", "Urkunde", "Garantie", "Brief"]
+# Tags the model may choose in addition to those already in Paperless
+tags = ["Steuer", "Versicherung", "Gesundheit", "Auto", "Wohnung", "Energie", "Telekommunikation", "Bank", "Arbeit", "Einkauf", "Reise", "Familie"]
+# Allow tags beyond these lists (at most 3 tags per document; existing tags are preferred)
+new_tags = true
+# Existing Paperless tags the model must never assign (inbox tags are always excluded)
+exclude_tags = []
+# How many known correspondents the model is shown
+known_correspondents = 300
+
+# Custom fields the model fills in when the document states them; created in Paperless if missing.
+# type: string | monetary | date | integer | float | boolean | url
+[[enrich.field]]
+name = "Betrag"
+type = "monetary"
+description = "Total amount of an invoice, receipt or payment, including VAT"
+
+[[enrich.field]]
+name = "Rechnungsnummer"
+type = "string"
+description = "Invoice or receipt number as printed (not an order or customer number)"
+
+[[enrich.field]]
+name = "Kundennummer"
+type = "string"
+description = "Customer or account number the correspondent uses for the recipient (not a personnel number)"
+
+[[enrich.field]]
+name = "Vertragsnummer"
+type = "string"
+description = "Number of a contract, insurance policy or membership (not an order, invoice, customer or personnel number)"
+
+[[enrich.field]]
+name = "Fällig am"
+type = "date"
+description = "Payment due date or deadline stated in the document"
+
+[aliases]
+# Unify correspondents: "name as recognised" = "name in Paperless"
+# "Telekom Deutschland GmbH" = "Telekom"
+
+[process]
+# Documents `paperclerk process` picks up, besides lacking the processed tag:
+#   "inbox": documents with an inbox tag; the model may replace Paperless' automatic guesses
+#   "all":   every document; outside the inbox, only missing values are filled in
+scope = "inbox"
+
+[import]
+# Tags for imported documents, in addition to the processed tag and the content tags
+tags = ["mail-import"]
+# Added to imported documents whose relevance is uncertain
+review_tag = "paperclerk-review"
+# File kinds to import; "office" (docx, xlsx, odt, ...) needs Tika/Gotenberg in Paperless
+kinds = ["pdf", "image"]
+# Smaller images (logos, signatures) are not even stored
+min_image_kb = 15
+min_image_side = 400
+max_file_mb = 100
+skip_inline_images = true
+unpack_zip = true
+# Mails with these Gmail labels (Takeout header X-Gmail-Labels) are ignored
+skip_labels = ["Spam", "Trash", "Papierkorb"]
+# Before uploading, search Paperless for the same content in another file
+content_check = true
+# Share of the text (word trigrams) that must appear in the Paperless document
+content_threshold = 0.75
+# Uploads that may wait in Paperless' queue at the same time
+max_pending = 8
+
+[import.scoring]
+# Relevance of mail attachments via Ollama's /v1/systemone (calibrated probabilities).
+# pplx-decider-flash (4B) only exists as an MLX build (Apple Silicon); on a Mac use
+# model = "pplx-decider-flash" and escalation_model = "pplx-decider".
+model = "pplx-decider"
+# Uncertain cases (between reject and accept) go to this model; "" = no escalation, they get the review tag
+escalation_model = ""
+# relevance >= accept: import; <= reject: skip; in between: escalate or import with the review tag
+accept = 0.75
+reject = 0.15
+# relevance = (1 - type_weight) * yes/no answer + type_weight * probability of all relevant categories
+type_weight = 0.5
+max_chars = 6000
+
+[import.merge]
+# Merge documents split across numbered attachments ("Vertrag 1.pdf", "Vertrag 2.pdf", ...)
+enabled = true
+# Merge when the continuation probability reaches this (cover letter + enclosure ~0.5, two invoices < 0.1)
+threshold = 0.35
+max_chars = 1500
+
+[imap]
+# Only for `paperclerk import imap` (Gmail: enable 2-step verification, create an app password)
+host = "imap.gmail.com"
+user = ""
+password = ""
+# "" = the "All Mail" folder (\All)
+folder = ""
+# Gmail search syntax, e.g. "has:attachment after:2015/01/01"
+query = "has:attachment"
+
+[text]
+# Pages read from imported files
+max_pages = 3
+ocr = true
+# "" = <data_dir>/tessdata (downloaded by `paperclerk init`)
+tessdata_dir = ""
+ocr_languages = "deu+eng"
+# Less text per page means the page counts as a scan
+min_chars_per_page = 50
+# Without readable text the first page goes to the model as an image of this size
+vision_max_side = 1280
+
+# Relevance categories for mail attachments (import only). The probability on relevant
+# categories feeds the relevance score (type_weight). Keep this list at the end of the file.
+[[import.category]]
+key = "invoice"
+relevant = true
+description = "Invoice, credit note, statement of charges, dunning letter or payment request addressed to the recipient"
+
+[[import.category]]
+key = "receipt"
+relevant = true
+description = "Till receipt, receipt, payment or donation confirmation"
+
+[[import.category]]
+key = "order"
+relevant = true
+description = "Order, booking or job confirmation listing specific items"
+
+[[import.category]]
+key = "contract"
+relevant = true
+description = "Contract, contract confirmation or amendment, termination or confirmation of termination"
+
+[[import.category]]
+key = "insurance"
+relevant = true
+description = "Individual insurance policy, endorsement, premium notice or claim settlement"
+
+[[import.category]]
+key = "bank"
+relevant = true
+description = "Bank, securities or credit card statement, loan or other financial document"
+
+[[import.category]]
+key = "authority"
+relevant = true
+description = "Notice or letter from a public authority or the tax office, tax certificate"
+
+[[import.category]]
+key = "payslip"
+relevant = true
+description = "Payslip, salary statement or employer certificate"
+
+[[import.category]]
+key = "health"
+relevant = true
+description = "Doctor's letter, medical findings, prescription, treatment plan, letter from the health insurer"
+
+[[import.category]]
+key = "ticket"
+relevant = true
+description = "Train, flight or event ticket, boarding pass, travel or hotel booking"
+
+[[import.category]]
+key = "certificate"
+relevant = true
+description = "School or job reference, certificate, deed, attendance confirmation or other proof"
+
+[[import.category]]
+key = "warranty"
+relevant = true
+description = "Warranty or guarantee document"
+
+[[import.category]]
+key = "letter"
+relevant = true
+description = "Individual letter addressed personally to the recipient"
+
+[[import.category]]
+key = "other_personal"
+relevant = true
+description = "Other document with a personal connection to the recipient"
+
+[[import.category]]
+key = "terms"
+relevant = false
+description = "General terms and conditions, terms of use, delivery or insurance conditions"
+
+[[import.category]]
+key = "withdrawal"
+relevant = false
+description = "Withdrawal or cancellation policy, model withdrawal form"
+
+[[import.category]]
+key = "privacy"
+relevant = false
+description = "Privacy notice, consent form or GDPR information sheet"
+
+[[import.category]]
+key = "product_info"
+relevant = false
+description = "Product information sheet (also for insurance or loans), data sheet, manual, price list or service description"
+
+[[import.category]]
+key = "advertising"
+relevant = false
+description = "Advertising, newsletter, brochure, catalogue, invitation or circular"
+
+[[import.category]]
+key = "image"
+relevant = false
+description = "Photo, graphic, logo, banner or screenshot that is not a document"
+
+[[import.category]]
+key = "general"
+relevant = false
+description = "Other general text without a personal connection to the recipient"

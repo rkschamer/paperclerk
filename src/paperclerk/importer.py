@@ -1,0 +1,124 @@
+"""`paperclerk import`: mail attachments -> extract -> merge -> relevance -> enrich -> upload."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections import Counter
+from pathlib import Path
+from sqlite3 import Row
+
+from .config import Config
+from .db import DB
+from .decision import UPLOAD_DECISIONS, decision
+from .enrich import VERSION, Enricher, Source, refresh_vocabulary, vocabulary
+from .ingest import ingest_imap, ingest_mbox
+from .merge import run_merge
+from .ollama import Ollama, OllamaError, OllamaUnavailable
+from .scoring import MAX_CONSECUTIVE_FAILS, MAX_FAILS, mail_lines, run_scoring, vision_images
+from .textextract import run_extract
+from .upload import preview_upload, run_upload
+from .util import Progress
+
+log = logging.getLogger(__name__)
+
+
+def source_for(db: DB, cfg: Config, row: Row) -> Source:
+    lines, mail = mail_lines(db, row)
+    return Source(
+        text=row["text"] or "",
+        filename=row["filename"] or "",
+        context=lines,
+        reference_date=(mail["date"] if mail else "") or row["added_at"],
+        sender_name=(mail["from_name"] if mail else "") or "",
+        images=vision_images(row, cfg),
+        date_fallback=True,
+    )
+
+
+def _pending_enrich(db: DB, cfg: Config) -> list[Row]:
+    rows = db.q(
+        """SELECT * FROM documents
+            WHERE skip_reason IS NULL AND part_of IS NULL AND (noul1 IS NOT NULL OR manual = 'yes')
+              AND (meta IS NULL OR meta_version IS NULL OR meta_version < ? OR model3 IS NOT ?)
+              AND (upload_status IS NULL OR upload_status IN ('failed', 'similar'))
+              AND fail_count < ?
+            ORDER BY rowid""", (VERSION, cfg.enrich.model, MAX_FAILS))
+    return [r for r in rows if decision(r, cfg) in UPLOAD_DECISIONS]
+
+
+def _recent_correspondents(db: DB) -> list[str]:
+    counts: Counter = Counter()
+    for r in db.q("SELECT meta FROM documents WHERE meta IS NOT NULL AND meta_version = ?", (VERSION,)):
+        counts[json.loads(r["meta"]).get("correspondent", "")] += 1
+    return [name for name, _ in counts.most_common() if name]
+
+
+def run_enrich(db: DB, cfg: Config, limit: int | None = None) -> int:
+    rows = _pending_enrich(db, cfg)
+    rows = rows[:limit] if limit else rows
+    if not rows:
+        return 0
+    refresh_vocabulary(db, cfg)
+    vocab = vocabulary(db, cfg, _recent_correspondents(db))
+    model = cfg.enrich.model
+    ollama = Ollama(cfg.ollama.url, cfg.ollama.keep_alive, cfg.ollama.timeout)
+    try:
+        ollama.require(model)
+        enricher = Enricher(cfg, vocab, ollama)
+        log.info("Metadata with %s for %d documents (%d known correspondents, %d document types, %d tags)", model,
+                 len(rows), len(vocab.correspondents), len(vocab.document_types), len(vocab.tags))
+        progress = Progress(len(rows), "Metadata")
+        consecutive = 0
+        for row in rows:
+            sha = row["sha256"]
+            t0 = time.monotonic()
+            try:
+                suggestion, res = enricher(source_for(db, cfg, row))
+            except OllamaUnavailable:
+                raise
+            except OllamaError as e:
+                secs = time.monotonic() - t0
+                consecutive += 1
+                db.update_doc(sha, fail_count=row["fail_count"] + 1, last_error=str(e)[:500])
+                db.log_llm(sha, "enrich", model, secs, error=str(e)[:2000])
+                db.commit()
+                progress.step(f"{row['filename']}: ERROR {e}", secs)
+                if consecutive >= MAX_CONSECUTIVE_FAILS:
+                    raise OllamaUnavailable(f"{consecutive} errors in a row – stopping. Last error: {e}")
+                continue
+            consecutive = 0
+            secs = time.monotonic() - t0
+            db.update_doc(sha, meta=json.dumps(suggestion, ensure_ascii=False), meta_version=VERSION, model3=model,
+                          secs3=round(secs, 2))
+            db.log_llm(sha, "enrich", model, secs, res.input_tokens, res.output_tokens, res.content)
+            db.commit()
+            s = suggestion
+            progress.step(f"{row['filename']}: {s['correspondent'] or '?'} | {s['document_type'] or '-'} | "
+                          f"{s['date']} | {s['title']} | {', '.join(s['tags'])}", secs)
+        progress.done()
+        return len(rows)
+    finally:
+        ollama.close()
+
+
+def run_import(db: DB, cfg: Config, source: str, paths: list[Path], dry_run: bool = False,
+               limit: int | None = None) -> dict:
+    if source == "mbox":
+        for path in paths:
+            log.info("%s", ingest_mbox(db, cfg, path).summary())
+    else:
+        log.info("%s", ingest_imap(db, cfg).summary())
+    run_extract(db, cfg, limit)
+    run_merge(db, cfg)
+    run_scoring(db, cfg, "score", limit)
+    run_scoring(db, cfg, "escalate", limit)
+    run_enrich(db, cfg, limit)
+    if dry_run:
+        print()
+        preview_upload(db, cfg, limit)
+        print("Dry run: nothing uploaded. Correct the results with `paperclerk review export`/`apply` if needed, "
+              "then run the same command without --dry-run.")
+        return {}
+    return run_upload(db, cfg, limit)

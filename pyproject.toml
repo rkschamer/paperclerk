@@ -1,0 +1,29 @@
+[project]
+name = "paperclerk"
+version = "0.2.0"
+description = "Enrich Paperless-ngx documents with local LLMs (Ollama) and import mail attachments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "openpyxl>=3.1",
+    "pillow>=10.0",
+    "pymupdf>=1.24",
+    "rapidfuzz>=3.0",
+]
+
+[project.scripts]
+paperclerk = "paperclerk.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paperclerk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
