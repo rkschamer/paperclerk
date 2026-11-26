@@ -41,6 +41,18 @@ Inbox documents get Paperless' automatic guesses replaced; documents outside the
 values (with `[process] scope = "all"`). Tags are only ever added. To process a document again, remove its
 `paperclerk` tag.
 
+To check the suggestions before they are written, use the terminal UI (works in Windows Terminal):
+
+```powershell
+uv run paperclerk ui
+```
+
+It looks like k9s: a list of the documents `process` would handle, with the values a suggestion changes
+highlighted, while the model works through the rest in the background. `a` accepts, `d` accepts and
+removes the inbox tag, `x` rejects (only the processed tag is added), Enter opens a document with an
+editable form next to its text, `/` filters, `?` shows all keys. What you type in the form is what gets
+written.
+
 ## Import mail attachments
 
 ```powershell
@@ -62,6 +74,7 @@ new mail use `uv run paperclerk import imap` (Gmail app password in `[imap]`).
 | `check` | check configuration, models, Paperless and IMAP |
 | `import mbox FILE...` / `import imap` | import mail attachments (`--dry-run`, `-n N`) |
 | `process` | enrich unprocessed Paperless documents (`--dry-run`, `-n N`) |
+| `ui` | check, edit and accept the suggestions of `process` in a terminal UI |
 | `review export` / `review apply [FILE]` | check and correct import results in a spreadsheet |
 | `status` | progress of imports and processing |
 | `show ID` | an imported document (hash prefix) or a processed Paperless document (number) |

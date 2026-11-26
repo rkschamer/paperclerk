@@ -13,7 +13,8 @@ workstation the tool runs on: RTX 3070 Ti (8 GB), 32 GB RAM, Windows 11, Ollama 
 | Topic | Decision | Section |
 | --- | --- | --- |
 | Where the models run | On the GPU workstation, not in the cluster; the tool talks to Paperless over its API | 4 |
-| Commands | `init`, `check`, `import mbox/imap`, `process`, `review`, `status`, `show` – nothing else until needed | 3 |
+| Commands | `init`, `check`, `import mbox/imap`, `process`, `ui`, `review`, `status`, `show` – nothing else until needed | 3 |
+| Interactive review | `paperclerk ui`: a k9s-style terminal UI over `process`; the form is what gets written | 6.5 |
 | One pipeline | `import` and `process` share one enrichment step; only `import` scores relevance first | 5 |
 | One model call per document | A single generative call returns all metadata as JSON, constrained by a schema | 5 |
 | Vocabulary | Paperless' existing objects plus configured document types and tags; new tags allowed (≤ 3) | 5.2 |
@@ -46,6 +47,7 @@ paperclerk check                     configuration, models, Paperless, IMAP
 paperclerk import mbox FILE...       import mail attachments from a Google Takeout export
 paperclerk import imap               the same directly from Gmail
 paperclerk process                   enrich Paperless documents that have not been processed yet
+paperclerk ui                        the same interactively: check, edit and accept suggestions
 paperclerk review export|apply [F]   check and correct import results in a spreadsheet
 paperclerk status                    progress
 paperclerk show ID                   one imported document (hash prefix) or Paperless document (number)
@@ -206,7 +208,8 @@ A document is processed when it does **not** carry the processed tag (`[paperles
 | Processed tag | added | added |
 
 The inbox tag stays: reviewing is the user's job. Tags and custom fields are read again right before
-writing, so changes made in the meantime are not lost.
+writing, so changes made in the meantime are not lost. In `paperclerk ui` the policy only shapes the
+first proposal; what the user types wins (section 6.5).
 
 ### 6.3 Dry run and cache
 
@@ -221,6 +224,42 @@ it was never applied).
 ### 6.4 Documents without text
 
 If Paperless has no OCR text, the tool downloads the document and sends the first page as an image.
+
+### 6.5 `ui`: checking suggestions interactively
+
+`paperclerk ui` puts a terminal UI on top of `process`. It uses the same selection, model call, stored
+suggestions and write step, so the two can be mixed: suggestions made by `process --dry-run` show up in
+the UI, and documents accepted or rejected in the UI are not touched by `process` again.
+
+- **Layout after k9s.** A header with the state (Paperless, model, queue, writes) and the keys of the
+  current view; a full-width list of documents in which the values a suggestion changes are highlighted,
+  so most documents can be checked and accepted from the list; `/` filters it (words, a status such as
+  `ready`, a number); Enter opens a document with the form next to its text; Esc goes back one level;
+  breadcrumbs at the bottom; `:` opens a command palette. Single keys work everywhere except while
+  typing, where Ctrl+S accepts and Esc stops editing. After accepting in the document view the next
+  document with a suggestion opens, so checking a batch is one key per document.
+- **The form is what gets written.** It starts as the document's current values with the suggestion
+  applied by the write policy (6.2); every value the user changes wins, also where `process` would
+  leave it alone: a filled custom field is overwritten, an emptied one is cleared, a tag removed from
+  the list is removed from the document. The changes are computed against the document as it was loaded
+  and applied to a fresh copy, as in 6.2. Values are checked while typing (dates like 28.04.2023,
+  amounts like 44,15 EUR); an invalid value blocks accepting and the form opens at it.
+- **Three outcomes per document.** *Accept* (`a`) writes the form and adds the processed tag. *Accept and
+  leave the inbox* (`d`) also removes the inbox tag, for a document that has now been reviewed – this
+  saves a second pass in Paperless. *Reject* (`x`) writes nothing but the processed tag, so the document
+  does not come back; the local status is `rejected`. Removing the processed tag brings any of them back.
+- **The model runs in the background.** On start every document without a usable stored suggestion is
+  queued; the model works through them one by one while the user checks the ready ones. The document
+  the user is looking at goes first, `g` asks for one right away, `p` pauses. If Ollama is unreachable
+  or the model is missing, the queue pauses and says so instead of failing document by document.
+- **Two worker threads.** One for the model, one for Paperless (loading, writing), each with its own
+  SQLite connection and HTTP clients; the UI thread never waits for the network. Writes are queued, so
+  accepting is instant; quitting waits for queued writes. The database is created before the threads
+  start (two threads creating it at once collided).
+- **Edits live in memory** until accepted. Quitting with unsaved edits asks first. Storing drafts would
+  raise the question of what `process` should do with them; nobody needed that yet.
+- **Textual** as the UI library: Python's `curses` does not exist on Windows, and Textual runs in Windows
+  Terminal, brings inputs with completion, tables and dialogs, and can be driven headless in tests.
 
 ## 7. `import`: mail attachments
 
@@ -366,7 +405,7 @@ One SQLite file, `<data_dir>/paperclerk.sqlite` (WAL mode):
 | `sources`, `messages`, `attachments` | mail sources with cursors, mails with attachments, every attachment incl. why it was dropped |
 | `documents` | one row per unique imported file or merged document: text, model answers, suggestion, corrections, upload state |
 | `merge_checks` | answers to "does B continue A?" |
-| `processed` | Paperless documents handled by `process`: suggestion, status, applied changes, note id |
+| `processed` | Paperless documents handled by `process` or `ui`: suggestion, status (suggested, applied, rejected, failed), written changes, note id |
 | `paperless_objects` | cache of correspondents, document types, tags, custom fields |
 | `llm_log` | every model call with timing, tokens and raw answer |
 
@@ -407,6 +446,10 @@ so typos do not silently fall back to defaults. Secrets can come from `PAPERLESS
 - **Several specialised model calls per document:** reads the text several times; one schema-constrained
   call is cheaper and consistent.
 - **Only existing document types and tags:** too restrictive for an instance with one document type.
+- **A spreadsheet for `process` as for imports:** the round trip (export, edit, apply) is slow for a few
+  new documents a week; the terminal UI shows text and suggestion together and writes at once.
+- **`curses`, urwid or prompt_toolkit for the UI:** `curses` is missing on Windows; the other two would
+  need the table, completion and dialogs built by hand. Textual has them and can be tested headless.
 
 ## 13. Open points
 

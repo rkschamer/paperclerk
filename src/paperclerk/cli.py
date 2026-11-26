@@ -163,6 +163,12 @@ def cmd_process(args: argparse.Namespace, db: DB, cfg: Config) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace, db: DB, cfg: Config) -> int:
+    from .ui import run_ui  # noqa: PLC0415 – Textual is only loaded for the UI
+
+    return run_ui(cfg)
+
+
 def cmd_review(args: argparse.Namespace, db: DB, cfg: Config) -> int:
     path = Path(args.file) if args.file else cfg.data_dir / "review.xlsx"
     if args.action == "export":
@@ -317,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_options(mbox)
     run_options(add("imap", cmd_import, "Gmail via IMAP ([imap] in the configuration)", sources))
     run_options(add("process", cmd_process, "enrich Paperless documents paperclerk has not processed yet"))
+    add("ui", cmd_ui, "check, edit and accept the suggestions of `process` in a terminal UI")
     review = add("review", cmd_review, "check and correct import results in a spreadsheet")
     review.add_argument("action", choices=("export", "apply"), help="export: write the sheet; apply: read it back")
     review.add_argument("file", nargs="?", help="spreadsheet (default: <data_dir>/review.xlsx)")

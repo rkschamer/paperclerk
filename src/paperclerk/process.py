@@ -32,9 +32,10 @@ def _hash(doc: dict) -> str:
     return hashlib.sha256((doc.get("content") or "").encode("utf-8", "replace")).hexdigest()
 
 
-def select(pl: Paperless, cfg: Config, registry: Registry, inbox: set[int]) -> list[dict]:
+def select(pl: Paperless, cfg: Config, registry: Registry, inbox: set[int], full: bool = False) -> list[dict]:
+    """Documents to process; full=True returns complete documents (with text) instead of id, title, tags."""
     processed = registry.get("tags", cfg.paperless.processed_tag)
-    params: dict = {"ordering": "id", "fields": "id,title,tags"}
+    params: dict = {"ordering": "id"} if full else {"ordering": "id", "fields": "id,title,tags"}
     if processed is not None:
         params["tags__id__none"] = processed
     if cfg.process.scope == "inbox":
@@ -107,18 +108,21 @@ def plan(doc: dict, s: dict, registry: Registry, in_inbox: bool) -> dict:
 
 
 def apply(pl: Paperless, registry: Registry, cfg: Config, doc_id: int, changes: dict,
-          old_note: int | None) -> int | None:
+          old_note: int | None, overwrite: bool = False) -> int | None:
+    """Write planned changes. Tags in changes["untag"] are removed; custom fields are only filled when
+    empty unless overwrite=True (edits the user made in `paperclerk ui`, where None clears a value)."""
     fresh = pl.document(doc_id)  # read tags and custom fields again right before writing
     payload: dict = {}
     if "title" in changes:
         payload["title"] = changes["title"][1][:128]
     if "correspondent" in changes:
-        payload["correspondent"] = registry.ensure("correspondents", changes["correspondent"][1])
+        payload["correspondent"] = registry.ensure("correspondents", changes["correspondent"][1] or "")
     if "document_type" in changes:
-        payload["document_type"] = registry.ensure("document_types", changes["document_type"][1])
+        payload["document_type"] = registry.ensure("document_types", changes["document_type"][1] or "")
     if "created" in changes:
         payload["created"] = changes["created"][1]
-    tags = list(fresh.get("tags") or [])
+    removed = {registry.get("tags", name) for name in changes.get("untag", [])}
+    tags = [t for t in fresh.get("tags") or [] if t not in removed]
     for name in [*changes.get("tags", []), cfg.paperless.processed_tag]:
         tid = registry.ensure("tags", name)
         if tid is not None and tid not in tags:
@@ -132,7 +136,7 @@ def apply(pl: Paperless, registry: Registry, cfg: Config, doc_id: int, changes: 
             slot = next((c for c in current if c["field"] == fid), None)
             if slot is None:
                 current.append({"field": fid, "value": value})
-            elif slot["value"] in (None, ""):
+            elif overwrite or slot["value"] in (None, ""):
                 slot["value"] = value
         payload["custom_fields"] = current
     pl.update(doc_id, payload)
@@ -162,6 +166,78 @@ def describe(doc: dict, changes: dict, in_inbox: bool, processed_tag: str) -> st
     return "\n".join(lines)
 
 
+def stored_suggestion(rec, cfg: Config, doc: dict) -> dict | None:
+    """The stored suggestion, if it is not applied yet and was made for this text by the current pipeline and
+    model."""
+    if (rec and rec["status"] == "suggested" and rec["version"] == VERSION
+            and rec["model"] == cfg.enrich.model and rec["content_hash"] == _hash(doc)):
+        return json.loads(rec["suggestion"])
+    return None
+
+
+def open_enricher(db: DB, cfg: Config) -> tuple[Ollama, Enricher]:
+    ollama = Ollama(cfg.ollama.url, cfg.ollama.keep_alive, cfg.ollama.timeout)
+    try:
+        ollama.require(cfg.enrich.model)
+    except OllamaError:
+        ollama.close()
+        raise
+    return ollama, Enricher(cfg, vocabulary(db, cfg), ollama)
+
+
+def suggest(db: DB, cfg: Config, pl: Paperless, enricher: Enricher, doc: dict) -> dict:
+    """Ask the model and store the suggestion. A failed request is recorded and re-raised."""
+    t0 = time.monotonic()
+    try:
+        suggestion, res = enricher(source_for(pl, cfg, doc))
+    except OllamaUnavailable:
+        raise
+    except OllamaError as e:
+        db.x("""INSERT INTO processed(doc_id, title, status, fail_count, error, updated_at)
+                VALUES (?, ?, 'failed', 1, ?, ?)
+                ON CONFLICT(doc_id) DO UPDATE SET status = 'failed', fail_count = processed.fail_count + 1,
+                    error = excluded.error, updated_at = excluded.updated_at""",
+             (doc["id"], doc.get("title"), str(e)[:500], now_iso()))
+        db.commit()
+        raise
+    db.log_llm(f"paperless:{doc['id']}", "process", cfg.enrich.model, time.monotonic() - t0,
+               res.input_tokens, res.output_tokens, res.content)
+    db.x("""INSERT INTO processed(doc_id, title, content_hash, suggestion, version, model, secs, status,
+                                  fail_count, error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'suggested', 0, NULL, ?)
+            ON CONFLICT(doc_id) DO UPDATE SET title = excluded.title,
+                content_hash = excluded.content_hash, suggestion = excluded.suggestion,
+                version = excluded.version, model = excluded.model, secs = excluded.secs,
+                status = 'suggested', fail_count = 0, error = NULL, updated_at = excluded.updated_at""",
+         (doc["id"], doc.get("title"), _hash(doc), json.dumps(suggestion, ensure_ascii=False),
+          VERSION, cfg.enrich.model, round(time.monotonic() - t0, 2), now_iso()))
+    db.commit()
+    return suggestion
+
+
+def record_written(db: DB, doc: dict, changes: dict, note_id: int | None, status: str = "applied") -> None:
+    """Remember what was written (status applied, or rejected: only the processed tag was added)."""
+    db.x("""INSERT INTO processed(doc_id, title, content_hash, status, changes, note_id, fail_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            ON CONFLICT(doc_id) DO UPDATE SET status = excluded.status, changes = excluded.changes,
+                note_id = excluded.note_id, error = NULL, updated_at = excluded.updated_at""",
+         (doc["id"], doc.get("title"), _hash(doc), status, json.dumps(changes, ensure_ascii=False), note_id,
+          now_iso()))
+    db.commit()
+
+
+def record_write_error(db: DB, doc_id: int, error: Exception) -> None:
+    db.x("UPDATE processed SET error = ?, updated_at = ? WHERE doc_id = ?",
+         (f"write failed: {error}"[:500], now_iso(), doc_id))
+    db.commit()
+
+
+def failed_ids(db: DB) -> set[int]:
+    """Documents whose model call failed MAX_FAILS times; skipped until asked for explicitly."""
+    return {r["doc_id"] for r in db.q("SELECT doc_id FROM processed WHERE status = 'failed' AND fail_count >= ?",
+                                      (MAX_FAILS,))}
+
+
 def run_process(db: DB, cfg: Config, dry_run: bool = False, limit: int | None = None) -> Counter:
     counts: Counter = Counter()
     with Paperless.from_config(cfg) as pl:
@@ -171,17 +247,14 @@ def run_process(db: DB, cfg: Config, dry_run: bool = False, limit: int | None = 
         if cfg.process.scope == "inbox" and not inbox:
             log.warning('Paperless has no inbox tag – nothing to do. Create one or set [process] scope = "all".')
             return counts
-        candidates = select(pl, cfg, registry, inbox)
-        failed = {r["doc_id"] for r in db.q("SELECT doc_id FROM processed WHERE status = 'failed' AND "
-                                             "fail_count >= ?", (MAX_FAILS,))}
-        candidates = [d for d in candidates if d["id"] not in failed]
+        failed = failed_ids(db)
+        candidates = [d for d in select(pl, cfg, registry, inbox) if d["id"] not in failed]
         candidates = candidates[:limit] if limit else candidates
         if not candidates:
             log.info("Nothing to process.")
             return counts
         log.info("%d documents to process (scope %s)%s", len(candidates), cfg.process.scope,
                  " – dry run" if dry_run else "")
-        vocab = vocabulary(db, cfg)
         ollama: Ollama | None = None
         enricher: Enricher | None = None
         progress = Progress(len(candidates), "Process")
@@ -190,42 +263,18 @@ def run_process(db: DB, cfg: Config, dry_run: bool = False, limit: int | None = 
                 t0 = time.monotonic()
                 doc = pl.document(light["id"])
                 rec = db.one("SELECT * FROM processed WHERE doc_id = ?", (doc["id"],))
-                content_hash = _hash(doc)
-                if (rec and rec["status"] == "suggested" and rec["version"] == VERSION
-                        and rec["model"] == cfg.enrich.model and rec["content_hash"] == content_hash):
-                    suggestion = json.loads(rec["suggestion"])
-                else:
+                suggestion = stored_suggestion(rec, cfg, doc)
+                if suggestion is None:
                     if enricher is None:
-                        ollama = Ollama(cfg.ollama.url, cfg.ollama.keep_alive, cfg.ollama.timeout)
-                        ollama.require(cfg.enrich.model)
-                        enricher = Enricher(cfg, vocab, ollama)
+                        ollama, enricher = open_enricher(db, cfg)
                     try:
-                        suggestion, res = enricher(source_for(pl, cfg, doc))
+                        suggestion = suggest(db, cfg, pl, enricher, doc)
                     except OllamaUnavailable:
                         raise
                     except OllamaError as e:
-                        fails = (rec["fail_count"] if rec else 0) + 1
-                        db.x("""INSERT INTO processed(doc_id, title, status, fail_count, error, updated_at)
-                                VALUES (?, ?, 'failed', ?, ?, ?)
-                                ON CONFLICT(doc_id) DO UPDATE SET status = 'failed', fail_count = excluded.fail_count,
-                                    error = excluded.error, updated_at = excluded.updated_at""",
-                             (doc["id"], doc.get("title"), fails, str(e)[:500], now_iso()))
-                        db.commit()
                         counts["failed"] += 1
                         progress.step(f"#{doc['id']}: ERROR {e}", time.monotonic() - t0)
                         continue
-                    db.log_llm(f"paperless:{doc['id']}", "process", cfg.enrich.model, time.monotonic() - t0,
-                               res.input_tokens, res.output_tokens, res.content)
-                    db.x("""INSERT INTO processed(doc_id, title, content_hash, suggestion, version, model, secs, status,
-                                                  fail_count, error, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, 'suggested', 0, NULL, ?)
-                            ON CONFLICT(doc_id) DO UPDATE SET title = excluded.title,
-                                content_hash = excluded.content_hash, suggestion = excluded.suggestion,
-                                version = excluded.version, model = excluded.model, secs = excluded.secs,
-                                status = 'suggested', fail_count = 0, error = NULL, updated_at = excluded.updated_at""",
-                         (doc["id"], doc.get("title"), content_hash, json.dumps(suggestion, ensure_ascii=False),
-                          VERSION, cfg.enrich.model, round(time.monotonic() - t0, 2), now_iso()))
-                    db.commit()
                 in_inbox = bool(inbox & set(doc.get("tags") or []))
                 changes = plan(doc, suggestion, registry, in_inbox)
                 if dry_run:
@@ -237,14 +286,10 @@ def run_process(db: DB, cfg: Config, dry_run: bool = False, limit: int | None = 
                         note_id = apply(pl, registry, cfg, doc["id"], changes, old_note)
                     except PaperlessError as e:  # the suggestion stays stored; the next run tries again
                         log.error("#%s: writing to Paperless failed: %s", doc["id"], e)
-                        db.x("UPDATE processed SET error = ?, updated_at = ? WHERE doc_id = ?",
-                             (f"write failed: {e}"[:500], now_iso(), doc["id"]))
-                        db.commit()
+                        record_write_error(db, doc["id"], e)
                         counts["failed"] += 1
                         continue
-                    db.x("UPDATE processed SET status = 'applied', changes = ?, note_id = ?, updated_at = ? "
-                         "WHERE doc_id = ?", (json.dumps(changes, ensure_ascii=False), note_id, now_iso(), doc["id"]))
-                    db.commit()
+                    record_written(db, doc, changes, note_id)
                     counts["applied"] += 1
                 progress.step(f"#{doc['id']} {suggestion.get('title')}", time.monotonic() - t0, quiet=dry_run)
         finally:

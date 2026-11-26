@@ -232,7 +232,7 @@ def parse_field(kind: str, raw: object) -> str | int | float | bool | None:
     if kind == "float":
         return number
     if kind == "monetary":
-        code = re.search(r"\b([A-Z]{3})\b", text)
+        code = re.search(r"(?<![A-Za-z])([A-Z]{3})(?![A-Za-z])", text)  # also Paperless' own "USD12.50"
         currency = code.group(1) if code else next(
             (c for sym, c in _CURRENCY_SYMBOLS.items() if sym in text.casefold()), "EUR")
         return f"{currency}{number:.2f}"
