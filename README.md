@@ -38,8 +38,8 @@ uv run paperclerk process                   # apply (the stored suggestions are 
 ```
 
 Inbox documents get Paperless' automatic guesses replaced; documents outside the inbox only get missing
-values (with `[process] scope = "all"`). Tags are only ever added. To process a document again, remove its
-`paperclerk` tag.
+values (with `[process] scope = "all"`). Tags are only ever added, and the inbox tag stays until you have
+reviewed the document. To process a document again, remove its `paperclerk` tag.
 
 To check the suggestions before they are written, use the terminal UI (works in Windows Terminal):
 
@@ -48,10 +48,13 @@ uv run paperclerk ui
 ```
 
 It looks like k9s: a list of the documents `process` would handle, with the values a suggestion changes
-highlighted, while the model works through the rest in the background. `a` accepts, `d` accepts and
-removes the inbox tag, `x` rejects (only the processed tag is added), Enter opens a document with an
+highlighted, while the model works through the rest in the background. `a` accepts: the values are
+written and the inbox tag (e.g. `new`) is removed, since you have now reviewed the document
+(`[process] remove_inbox_tags = false` keeps it). `x` rejects:
+only the processed tag is added and the document stays in the inbox; changed your mind, `a` on it still
+writes it. Enter opens a document with an
 editable form next to its text, `/` filters, `?` shows all keys. What you type in the form is what gets
-written.
+written; type the inbox tag back into the tags to keep a document in the inbox.
 
 ## Import mail attachments
 

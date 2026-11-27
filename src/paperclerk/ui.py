@@ -321,6 +321,7 @@ class Item:
     fail_count: int = 0
     error: str = ""
     secs: float | None = None
+    tagged: bool = False  # written or rejected in this session: Paperless has the processed tag
 
     @property
     def id(self) -> int:
@@ -328,15 +329,21 @@ class Item:
 
     @property
     def open(self) -> bool:
+        """Still to be checked: not written, not rejected."""
         return self.state not in FINISHED
 
     @property
+    def editable(self) -> bool:
+        """The form can still be changed and accepted – also after rejecting, which only added the processed tag."""
+        return self.state not in ("saving", "done")
+
+    @property
     def edited(self) -> bool:
-        return self.open and self.draft != self.base
+        return self.editable and self.draft != self.base
 
     @property
     def label(self) -> str:
-        return "edited" if self.edited and self.state != "running" else self.state
+        return "edited" if self.edited and self.state not in ("running", "rejected") else self.state
 
 
 def form_rows(cfg: Config) -> list[tuple[str, str]]:
@@ -499,20 +506,31 @@ List                                      Document
 Both                                      While editing
   a       accept: write the values to       Ctrl+S      accept
           Paperless, add the processed tag  Tab Enter   next field (Shift+Tab: previous)
-  d       accept and remove the inbox tag   →           take the grey completion
+          {accept:<32}  →           take the grey completion
   x       reject: change nothing, only add  Esc         stop editing
           the processed tag                 Tags are separated by commas; removing one removes
-  g       ask the model (again) now         it from the document. Dates may be typed as
-  u       undo your edits                   28.04.2023, amounts as 44,15 EUR. An empty field
-  o       open in Paperless (browser)       clears the value.
-  A       accept all with a suggestion
-  p       pause / resume the model        Status
-  F5      reload from Paperless             queued   waiting for the model   ready   to check
-  :       commands                          running  the model works on it   edited  changed by you
-  ?       this help                         failed   g tries again           new     no suggestion
+  g       ask the model (again) now         it from the document. {tags1}
+  u       undo your edits                   {tags2} Dates may be typed
+  o       open in Paperless (browser)       as 28.04.2023, amounts as 44,15 EUR. An empty field
+  A       accept all with a suggestion      clears the value.
+  p       pause / resume the model
+  F5      reload from Paperless           Status
+  :       commands                          queued   waiting for the model   ready   to check
+  ?       this help                         running  the model works on it   edited  changed by you
+                                            failed   g tries again           new     no suggestion
                                             saving / done: written           rejected: tag only
 
-To process a written or rejected document again, remove its processed tag in Paperless."""
+A rejected document keeps its form: a or Ctrl+S still writes it, g asks the model again. To process
+a written document again, remove its processed tag in Paperless and press F5."""
+
+
+def help_text(cfg: Config) -> str:
+    """The help, saying what accepting does with the inbox tag ([process] remove_inbox_tags)."""
+    if cfg.process.remove_inbox_tags:
+        return HELP.format(accept="and remove the inbox tag", tags1="Type the inbox tag back in to",
+                           tags2="keep the document in the inbox.")
+    return HELP.format(accept="and keep the inbox tag", tags1="Remove the inbox tag to take",
+                       tags2="the document out of the inbox.")
 
 
 class Help(ModalScreen[None]):
@@ -523,9 +541,13 @@ class Help(ModalScreen[None]):
     """
     BINDINGS = [Binding("escape,q,question_mark,f1", "close", "Close")]
 
+    def __init__(self, text: str):
+        super().__init__()
+        self.text = text
+
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Static(HELP, markup=False)
+            yield Static(self.text, markup=False)
 
     def action_close(self) -> None:
         self.dismiss()
@@ -578,7 +600,9 @@ class View(Screen):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         item = self.selected()
         if action in ("accept", "reject", "suggest", "undo", "edit"):
-            if item is None or not item.open:
+            if item is None or not item.editable:
+                return None
+            if action == "reject" and not item.open:
                 return None
             if action == "undo" and not item.edited:
                 return None
@@ -612,7 +636,7 @@ class View(Screen):
         self.pc.reload()
 
     def action_help(self) -> None:
-        self.app.push_screen(Help())
+        self.app.push_screen(Help(help_text(self.pc.cfg)))
 
     def action_palette(self) -> None:
         self.app.action_command_palette()
@@ -633,7 +657,6 @@ class ListScreen(View):
     """
     BINDINGS = [
         Binding("a", "accept", "Accept"),
-        Binding("d", "accept(True)", "Accept, leave inbox"),
         Binding("x", "reject", "Reject"),
         Binding("g", "suggest", "Ask model"),
         Binding("u", "undo", "Undo edits"),
@@ -649,8 +672,7 @@ class ListScreen(View):
         Binding("j", "move(1)", "Down"),
         Binding("k", "move(-1)", "Up"),
     ]
-    HINTS = [("enter", "Open", "open"), ("a", "Accept", "accept"), ("d", "Accept, leave inbox", "accept"),
-             ("x", "Reject", "reject"), ("g", "Ask model", "suggest"), ("u", "Undo edits", "undo"),
+    HINTS = [("enter", "Open", "open"), ("a", "Accept", "accept"), ("x", "Reject", "reject"), ("g", "Ask model", "suggest"), ("u", "Undo edits", "undo"),
              ("o", "Open in Paperless", "browser"), ("/", "Filter", None), ("A", "Accept all", "accept_all"),
              ("p", "Pause model", "pause"), ("f5", "Reload", None), (":", "Commands", None), ("?", "Help", None),
              ("q", "Quit", None)]
@@ -809,11 +831,11 @@ class ListScreen(View):
             self.rebuild()
         self.table.focus()
 
-    def action_accept(self, leave_inbox: bool = False) -> None:
+    def action_accept(self) -> None:
         item = self.selected()
         if item is None:
             return
-        problem = self.pc.accept(item, leave_inbox)
+        problem = self.pc.accept(item)
         if problem is None:
             self._move_on()
         elif problem in self.pc.labels:  # an invalid value: show it in the form
@@ -853,7 +875,6 @@ class DocScreen(View):
     BINDINGS = [
         Binding("e", "edit", "Edit"),
         Binding("a", "accept", "Accept"),
-        Binding("d", "accept(True)", "Accept, leave inbox"),
         Binding("x", "reject", "Reject"),
         Binding("g", "suggest", "Ask model"),
         Binding("u", "undo", "Undo edits"),
@@ -868,8 +889,7 @@ class DocScreen(View):
         Binding("escape,q", "back", "Back"),
         Binding("ctrl+s", "save", "Accept", priority=True),
     ]
-    HINTS = [("e", "Edit", "edit"), ("a", "Accept", "accept"), ("d", "Accept, leave inbox", "accept"),
-             ("x", "Reject", "reject"), ("g", "Ask model", "suggest"), ("u", "Undo edits", "undo"),
+    HINTS = [("e", "Edit", "edit"), ("a", "Accept", "accept"), ("x", "Reject", "reject"), ("g", "Ask model", "suggest"), ("u", "Undo edits", "undo"),
              ("o", "Open in Paperless", "browser"), ("n", "Next", "step(1)"), ("N", "Previous", "step(-1)"),
              ("t", "Text only", None), ("p", "Pause model", "pause"), ("?", "Help", None), ("esc", "Back", None)]
     TYPING_HINTS = [("ctrl-s", "Accept", True), ("tab", "Next field", True), ("shift-tab", "Previous field", True),
@@ -964,8 +984,8 @@ class DocScreen(View):
         self.pc.engine.jobs.preferred = item.id
         for key, widget in self.widgets.items():
             self._put(key, item.draft)
-            widget.disabled = not item.open
-        if not item.open and self.typing():
+            widget.disabled = not item.editable
+        if not item.editable and self.typing():
             self.query_one("#text-box").focus()
         self.query_one("#heading", Static).update(self._heading(item))
         self.query_one("#form-box").border_title = f" #{item.id} {_cut(item.doc.get('title') or '', 60)} "
@@ -996,7 +1016,8 @@ class DocScreen(View):
             "failed": ("The model failed – g tries again.", "red"),
             "saving": ("Writing to Paperless…", "yellow"),
             "done": ("Written to Paperless.", "green"),
-            "rejected": ("Rejected – only the processed tag was added.", "dim"),
+            "rejected": ("Rejected – only the processed tag was added. a or Ctrl+S still writes the form, "
+                         "g asks the model again.", "dim"),
         }
         message, style = lines.get(item.label, ("", ""))
         t.append("\n" + message, style)
@@ -1052,7 +1073,7 @@ class DocScreen(View):
 
     def _edited(self, widget: Input | TextArea, value: str) -> None:
         item, key = self.selected(), self.key_of.get(widget.id or "")
-        if item is None or key is None or not item.open:
+        if item is None or key is None or not item.editable:
             return
         set_value(item.draft, key, value)
         self._decorate(item)
@@ -1064,18 +1085,15 @@ class DocScreen(View):
 
     def action_edit(self) -> None:
         item = self.selected()
-        if item is not None and item.open:
+        if item is not None and item.editable:
             self.remove_class("text-only")
             self.widgets["title"].focus()
 
-    def action_accept(self, leave_inbox: bool = False) -> None:
+    def action_accept(self) -> None:
         item = self.selected()
         if item is None:
             return
-        if leave_inbox:
-            self.pc.leave_inbox(item)
-            self.show(item)
-        problem = self.pc.accept(item, leave_inbox)
+        problem = self.pc.accept(item)
         if problem is None:
             self._move_on(item)
         elif problem in self.widgets:
@@ -1256,20 +1274,13 @@ class ProcessApp(App[None]):
 
     # -------------------------------------------------------- operations
 
-    def leave_inbox(self, item: Item) -> None:
-        if self.engine.registry is not None and item.open:
-            inbox = {self.engine.registry.names["tags"].get(t, "").casefold() for t in self.inbox}
-            item.draft.tags = [t for t in item.draft.tags if t.casefold() not in inbox]
-
-    def accept(self, item: Item, leave_inbox: bool = False) -> str | None:
+    def accept(self, item: Item) -> str | None:
         """Start writing the document. Returns None, or why not: "nothing" or the key of an invalid field."""
-        if not item.open:
+        if not item.editable:
             return "finished"
-        if leave_inbox:
-            self.leave_inbox(item)
-        elif item.suggestion is None and not item.edited:
-            self.notify("No suggestion yet. Press g to ask the model now, edit the values yourself, or x to "
-                        "reject.", markup=False)
+        if item.suggestion is None and not item.edited:
+            self.notify("No suggestion yet. Press g to ask the model now" + (", edit the values yourself, or x to "
+                        "reject." if item.open else " or edit the values yourself."), markup=False)
             return "nothing"
         changes, errors = changes_for(item.current, item.draft, self.cfg)
         if errors:
@@ -1282,9 +1293,10 @@ class ProcessApp(App[None]):
         return None
 
     def reject(self, item: Item) -> None:
+        """Write nothing but the processed tag. The form is kept, so the document can still be accepted."""
         if item.open:
-            item.draft = item.current.copy()  # nothing changes except the processed tag
             self._write(item, {}, "rejected")
+            self.notify(f"#{item.id} rejected – a or Ctrl+S on it still writes it.", markup=False)
 
     def _write(self, item: Item, changes: dict, status: str) -> None:
         item.state, item.error = "saving", ""
@@ -1294,7 +1306,7 @@ class ProcessApp(App[None]):
         self.changed(item)
 
     def suggest(self, item: Item) -> None:
-        if not item.open or item.state == "running":
+        if not item.editable or item.state == "running":
             return
         item.state, item.error = "queued", ""
         self.engine.jobs.put(item.id, front=True)
@@ -1349,7 +1361,7 @@ class ProcessApp(App[None]):
     async def action_quit(self) -> None:
         if isinstance(self.screen, ModalScreen):
             return
-        edited = [i for i in self.items if i.edited]
+        edited = [i for i in self.items if i.edited and i.open]  # a rejected document is handled already
         if edited:
             self.push_screen(Confirm(f"{len(edited)} documents have edits that are not written to Paperless. "
                                      "Quit and lose them?"), lambda yes: self._quit() if yes else None)
@@ -1377,13 +1389,15 @@ class ProcessApp(App[None]):
         items: list[Item] = []
         for doc in msg.docs:
             prev = old.get(doc["id"])
-            if prev is not None and not prev.open:
+            if prev is not None and prev.state == "saving":  # the write is still on its way
                 items.append(prev)
                 continue
+            if prev is not None and prev.tagged:  # written or rejected, but its processed tag was removed in
+                prev = None  # Paperless since: process it again
             rec = msg.records.get(doc["id"], {})
             suggestion = msg.suggestions.get(doc["id"])
             in_inbox = bool(self.inbox & set(doc.get("tags") or []))
-            base = proposal(doc, suggestion, registry, self.cfg, in_inbox)
+            base = proposal(doc, suggestion, registry, self.cfg, self.inbox)
             item = Item(doc, in_inbox, current(doc, registry, self.cfg), base, base.copy(), suggestion, "queued",
                         note_id=rec.get("note_id"), fail_count=rec.get("fail_count") or 0,
                         secs=rec.get("secs") if suggestion else None)
@@ -1397,7 +1411,9 @@ class ProcessApp(App[None]):
                 item.state, item.error = "failed", f"Model: {rec.get('error') or ''}"
             items.append(item)
         seen = {i.id for i in items}
-        items += [i for i in old.values() if i.id not in seen and not i.open]  # keep written ones in view
+        kept = [i for i in old.values() if i.id not in seen and (i.tagged or not i.open)]
+        items += kept  # written and rejected ones stay in view; a rejected one can still be accepted
+        seen |= {i.id for i in kept}
         for gone in (i for i in old.values() if i.id not in seen):
             self.engine.jobs.discard(gone.id)
         items.sort(key=lambda i: i.id)
@@ -1432,7 +1448,7 @@ class ProcessApp(App[None]):
             return
         old = item.base
         item.suggestion = msg.suggestion
-        item.base = proposal(item.doc, msg.suggestion, self.engine.registry, self.cfg, item.in_inbox)
+        item.base = proposal(item.doc, msg.suggestion, self.engine.registry, self.cfg, self.inbox)
         item.draft = merge(old, item.base, item.draft)
         item.state, item.error, item.secs, item.fail_count = "ready", "", msg.secs, 0
         known = {t.casefold() for t in self.tag_suggester.tags}
@@ -1458,7 +1474,7 @@ class ProcessApp(App[None]):
         item = self.by_id.get(msg.doc_id)
         if item is not None:  # stored status applied / rejected -> shown as done / rejected
             item.state = "done" if msg.status == "applied" else msg.status
-            item.note_id, item.error = msg.note_id, ""
+            item.note_id, item.error, item.tagged = msg.note_id, "", True
         self.changed(item)
         self._finish_quit()
 

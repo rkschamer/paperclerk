@@ -81,6 +81,9 @@ description = "Payment due date or deadline stated in the document"
 #   "inbox": documents with an inbox tag; the model may replace Paperless' automatic guesses
 #   "all":   every document; outside the inbox, only missing values are filled in
 scope = "inbox"
+# Accepting a document in `paperclerk ui` removes its inbox tags, since it has now been reviewed
+# (type one back into the tags to keep the document in the inbox). `paperclerk process` never removes them.
+remove_inbox_tags = true
 
 [import]
 # Tags for imported documents, in addition to the processed tag and the content tags

@@ -1,8 +1,10 @@
 """The form of `paperclerk ui`: the values a Paperless document will have after accepting.
 
 A draft starts as the document's current values with the model's suggestion applied according to the
-write policy of `process` (section 6.2 of docs/design.md). Whatever the user then types wins: the
-changes are computed against the document as loaded and written with `process.apply(overwrite=True)`.
+write policy of `process` (section 6.2 of docs/design.md) and, with `[process] remove_inbox_tags`, without
+the inbox tags, because accepting means the user has reviewed the document. Whatever the user then types
+wins: the changes are computed against the document as loaded and written with
+`process.apply(overwrite=True)`.
 """
 
 from __future__ import annotations
@@ -77,12 +79,16 @@ def current(doc: dict, registry: Registry, cfg: Config) -> Draft:
     )
 
 
-def proposal(doc: dict, suggestion: dict | None, registry: Registry, cfg: Config, in_inbox: bool) -> Draft:
-    """The document after applying the suggestion with the write policy of `process`."""
+def proposal(doc: dict, suggestion: dict | None, registry: Registry, cfg: Config, inbox: set[int]) -> Draft:
+    """The document after accepting: the suggestion applied with the write policy of `process` and, if
+    configured, the inbox tags (ids in `inbox`) removed."""
     d = current(doc, registry, cfg)
+    if cfg.process.remove_inbox_tags:
+        leaving = {registry.names["tags"].get(t, "").casefold() for t in inbox}
+        d.tags = [t for t in d.tags if t.casefold() not in leaving]
     if not suggestion:
         return d
-    changes = plan(doc, suggestion, registry, in_inbox)
+    changes = plan(doc, suggestion, registry, bool(inbox & set(doc.get("tags") or [])))
     if "title" in changes:
         d.title = changes["title"][1]
     for key in ("correspondent", "document_type"):

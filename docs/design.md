@@ -20,6 +20,7 @@ workstation the tool runs on: RTX 3070 Ti (8 GB), 32 GB RAM, Windows 11, Ollama 
 | Vocabulary | Paperless' existing objects plus configured document types and tags; new tags allowed (≤ 3) | 5.2 |
 | Processed marker | A tag (`paperclerk`) in Paperless, not only the local database | 6.1 |
 | Write policy | Inbox documents: the model replaces Paperless' automatic guesses. Reviewed documents: only gaps are filled. Tags are only added | 6.2 |
+| Inbox tag | `process` leaves it; accepting in `ui` removes it, because accepting is the review (`[process] remove_inbox_tags`, default true) | 6.2, 6.5 |
 | Dry runs | Suggestions are stored; the next real run applies them without asking the model again | 6.3 |
 | Relevance (import) | pplx-decider via `/v1/systemone`: calibrated yes/no plus category probabilities | 7.5 |
 | Split documents (import) | Numbered attachments of one mail are merged if the model confirms each boundary | 7.4 |
@@ -207,9 +208,10 @@ A document is processed when it does **not** carry the processed tag (`[paperles
 | Summary | note added (an earlier paperclerk note is replaced) | same |
 | Processed tag | added | added |
 
-The inbox tag stays: reviewing is the user's job. Tags and custom fields are read again right before
-writing, so changes made in the meantime are not lost. In `paperclerk ui` the policy only shapes the
-first proposal; what the user types wins (section 6.5).
+`process` leaves the inbox tag on: the inbox stands for "the user should look at this", and nobody has
+looked yet. Accepting in `paperclerk ui` is that look, so there the inbox tag is removed (6.5). Tags and
+custom fields are read again right before writing, so changes made in the meantime are not lost. In
+`paperclerk ui` the policy only shapes the first proposal; what the user types wins (section 6.5).
 
 ### 6.3 Dry run and cache
 
@@ -244,10 +246,28 @@ the UI, and documents accepted or rejected in the UI are not touched by `process
   the list is removed from the document. The changes are computed against the document as it was loaded
   and applied to a fresh copy, as in 6.2. Values are checked while typing (dates like 28.04.2023,
   amounts like 44,15 EUR); an invalid value blocks accepting and the form opens at it.
-- **Three outcomes per document.** *Accept* (`a`) writes the form and adds the processed tag. *Accept and
-  leave the inbox* (`d`) also removes the inbox tag, for a document that has now been reviewed – this
-  saves a second pass in Paperless. *Reject* (`x`) writes nothing but the processed tag, so the document
-  does not come back; the local status is `rejected`. Removing the processed tag brings any of them back.
+- **Two outcomes per document.** *Accept* (`a`, also *Accept all*) writes the form, adds the processed
+  tag and removes the inbox tags (unless configured otherwise, see below): the user has now reviewed
+  the document, so it needs no second pass in Paperless. *Reject* (`x`) writes nothing but the processed tag, so the document does not come back;
+  the local status is `rejected`. Its inbox tag stays, because the document still needs a look in
+  Paperless. Removing the processed tag brings either of them back, in a running UI with the next
+  reload (`F5`).
+- **A reject can be taken back in the session.** A wrong `x` is easy to hit and the UI moves on to the
+  next document, so rejecting keeps the form (suggestion and edits) and leaves it editable: `a` / Ctrl+S
+  on the rejected document still writes it, `g` asks the model again. Rejected documents stay out of
+  *Accept all*, the "next document" step and the unsaved-edits check on quit – they are handled. After
+  a restart a rejected document is no longer listed (it has the processed tag); removing the tag in
+  Paperless brings it back. Written documents are final in the UI: fixing them is an edit in Paperless.
+- **Leaving the inbox is part of the form.** The form starts without the inbox tags, so the tag row
+  shows their removal like any other change (`−new`) and accepting writes exactly what is shown. To keep
+  a document in the inbox (a bill still to pay), the user types the inbox tag back in. An earlier
+  version kept the inbox tag on accept and had a second key (`d`) to remove it; in practice accepting
+  always meant "reviewed", and one key per document is enough.
+- **`[process] remove_inbox_tags`** (default `true`) turns this off for a workflow where documents are
+  reviewed again in Paperless itself. The form then starts with the inbox tags; deleting one by hand
+  still removes it. A setting rather than a second key, because it describes the workflow, not a
+  decision per document. Which tags count as inbox tags is not configured in paperclerk: it is
+  Paperless' "Inbox tag" flag (`is_inbox_tag`, read with the other tags on every load).
 - **The model runs in the background.** On start every document without a usable stored suggestion is
   queued; the model works through them one by one while the user checks the ready ones. The document
   the user is looking at goes first, `g` asks for one right away, `p` pauses. If Ollama is unreachable
@@ -370,6 +390,7 @@ against the manual labels.
 | `mail-import` (import tags) | import | origin |
 | `paperclerk-review` (review tag) | import | relevance uncertain |
 | content tags | import and process | topic |
+| inbox tags (here `new`, `paperless-gpt`) | Paperless | not reviewed yet: `process` picks these documents; accepting in `ui` removes the tags |
 
 ### 8.2 Creating objects
 

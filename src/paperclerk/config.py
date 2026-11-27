@@ -130,6 +130,7 @@ class EnrichConfig:
 @dataclass
 class ProcessConfig:
     scope: str = "inbox"
+    remove_inbox_tags: bool = True  # when a document is accepted in `paperclerk ui`
 
 
 @dataclass

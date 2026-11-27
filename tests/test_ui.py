@@ -7,7 +7,7 @@ import time
 
 from paperclerk.draft import Draft, changes_for, current, merge, proposal
 from paperclerk.paperless import Registry
-from paperclerk.ui import Confirm, DocScreen, Help, Jobs, ProcessApp
+from paperclerk.ui import Confirm, DocScreen, Help, Jobs, ProcessApp, help_text
 from samples import INVOICE
 from test_merge import CONTRACT
 
@@ -31,14 +31,28 @@ def test_proposal_follows_the_write_policy(db, cfg, fake_paperless):
     doc = fake_paperless.docs[10]
     cur = current(doc, registry, cfg)
     assert (cur.correspondent, cur.tags, cur.fields["Betrag"]) == ("info@o2.com", ["new"], "EUR10.00")
-    d = proposal(doc, SUGGESTION, registry, cfg, in_inbox=True)
+    d = proposal(doc, SUGGESTION, registry, cfg, inbox={1})
     assert d.title == "Rechnung Mobilfunk April 2023" and d.correspondent == "Telekom Deutschland"
-    assert d.tags == ["new", "Telekommunikation"] and d.date == "2023-04-17"
+    assert d.tags == ["Telekommunikation"] and d.date == "2023-04-17"  # accepting leaves the inbox
     assert d.fields["Betrag"] == "EUR10.00"  # filled values are kept
     assert d.fields["Rechnungsnummer"] == "4400" and d.note == "Mobilfunkrechnung."
-    outside = proposal(doc, SUGGESTION, registry, cfg, in_inbox=False)
+    assert proposal(doc, None, registry, cfg, inbox={1}).tags == []  # also before the model has answered
+    outside = proposal(doc, SUGGESTION, registry, cfg, inbox=set())
     assert outside.title == "Rechnung Mobilfunk April 2023"  # the title was only the file name
     assert outside.correspondent == "info@o2.com" and outside.date == "2023-04-30"
+    assert outside.tags == ["new", "Telekommunikation"]
+    cfg.process.remove_inbox_tags = False
+    assert proposal(doc, SUGGESTION, registry, cfg, inbox={1}).tags == ["new", "Telekommunikation"]
+
+
+def test_help_follows_the_inbox_setting(cfg):
+    on = help_text(cfg)
+    cfg.process.remove_inbox_tags = False
+    off = help_text(cfg)
+    assert "and remove the inbox tag" in on and "and keep the inbox tag" in off
+    for text in (on, off):
+        line = next(x for x in text.splitlines() if "take the grey completion" in x)
+        assert line.index("→") == 44  # the columns stay aligned
 
 
 def test_changes_from_edits(cfg):
@@ -129,6 +143,8 @@ def test_review_flow_in_the_document_view(db, cfg, fake_ollama, fake_paperless, 
         assert doc.widgets["title"].value == "Rechnung Mobilfunk April 2023"
         assert doc.widgets["correspondent"].value == "Telekom Deutschland"
         assert doc.row_of["correspondent"].has_class("changed")
+        assert doc.widgets["tags"].value == "Telekommunikation, Mobilfunk"  # without the inbox tag
+        assert "−new" in str(doc.row_of["tags"].query_one(".was").render())
 
         await pilot.press("e")  # the title is selected: typing replaces it; letters do not trigger shortcuts
         await pilot.press(*"Handyrechnung April", "tab", "tab", "tab", "tab")
@@ -137,14 +153,15 @@ def test_review_flow_in_the_document_view(db, cfg, fake_ollama, fake_paperless, 
         assert app.by_id[10].draft.tags[-1] == "Versicherung"
         await pilot.press("ctrl+s")  # accept, then the next document with a suggestion
         assert doc.doc_id == 11 and app.screen is doc
-        await pilot.press("d")  # accept and remove the inbox tag; nothing left: back to the list
+        await pilot.press("e", "tab", "tab", "tab", "tab", "end", *", new")  # stays in the inbox
+        await pilot.press("escape", "a")  # stop editing, accept; nothing left: back to the list
         await pilot.pause()
         assert app.screen is screen
         await until(pilot, lambda: all(i.state == "done" for i in app.items))
 
         assert fp.docs[10]["title"] == "Handyrechnung April"
-        assert _tag_names(fp, 10) == ["new", "Telekommunikation", "Mobilfunk", "Versicherung", "paperclerk"]
-        assert "new" not in _tag_names(fp, 11) and "paperclerk" in _tag_names(fp, 11)
+        assert _tag_names(fp, 10) == ["Telekommunikation", "Mobilfunk", "Versicherung", "paperclerk"]
+        assert _tag_names(fp, 11) == ["new", "Versicherung", "Immobilie", "paperclerk"]
         assert {r["doc_id"]: r["status"] for r in db.q("SELECT * FROM processed")} == {10: "applied", 11: "applied"}
 
     run(app, steps)
@@ -216,6 +233,55 @@ def test_reject_and_unavailable_model(db, cfg, fake_ollama, fake_paperless):
         await until(pilot, lambda: app.by_id[10].state == "rejected")
         assert fp.docs[10]["title"] == "scan_2023_04" and _tag_names(fp, 10) == ["new", "paperclerk"]
         assert db.one("SELECT status FROM processed WHERE doc_id = 10")["status"] == "rejected"
+
+    run(app, steps)
+
+
+def test_a_rejected_document_can_still_be_accepted(db, cfg, fake_ollama, fake_paperless):
+    fp = fake_paperless
+    _setup(fp)
+    app = ProcessApp(cfg)
+
+    async def steps(pilot):
+        await until(pilot, _ready(app))
+        await pilot.press("enter")
+        await pilot.pause()
+        doc = app.screen
+        title = doc.widgets["title"].value
+        await pilot.press("x")  # by mistake: rejected, and the next document opens
+        await until(pilot, lambda: app.by_id[10].state == "rejected")
+        assert doc.doc_id == 11 and _tag_names(fp, 10) == ["new", "paperclerk"]
+        assert app.acceptable() == [app.by_id[11]]  # handled: not part of Accept all
+        await pilot.press("N")  # back to it: the form still holds the suggestion and can be edited
+        await pilot.pause()
+        assert doc.doc_id == 10 and doc.widgets["title"].value == title and not doc.widgets["title"].disabled
+        assert doc.check_action("reject", ()) is None and doc.check_action("accept", ()) is True
+        await pilot.press("ctrl+s")
+        await until(pilot, lambda: app.by_id[10].state == "done")
+        assert fp.docs[10]["title"] == title
+        assert "new" not in _tag_names(fp, 10) and "paperclerk" in _tag_names(fp, 10)
+        assert db.one("SELECT status FROM processed WHERE doc_id = 10")["status"] == "applied"
+
+    run(app, steps)
+
+
+def test_removing_the_processed_tag_brings_a_document_back(db, cfg, fake_ollama, fake_paperless):
+    fp = fake_paperless
+    _setup(fp)
+    app = ProcessApp(cfg)
+
+    async def steps(pilot):
+        await until(pilot, _ready(app))
+        await pilot.press("x")
+        await until(pilot, lambda: app.by_id[10].state == "rejected")
+        await pilot.press("f5")  # still tagged: stays rejected
+        await until(pilot, lambda: not app.loading)
+        assert app.by_id[10].state == "rejected"
+        processed = next(t["id"] for t in fp.objects["tags"] if t["name"] == "paperclerk")
+        fp.docs[10]["tags"].remove(processed)  # the user removes the tag in Paperless
+        await pilot.press("f5")
+        await until(pilot, lambda: app.by_id[10].state == "ready")
+        assert app.by_id[10].draft.title == "Rechnung Mobilfunk April 2023"
 
     run(app, steps)
 
