@@ -279,8 +279,14 @@ class ImportEngine:
             self.reading = ("read" if done or self.source == "imap" else "stopped") + (
                 f" · {_found(total)}" if total.messages else "")
         except (ImapError, OSError) as e:
+            db.commit()  # what was read so far, with its position
             self.reading = f"error: {e}"
             self.post(PipelineFailed(f"Reading mail failed: {e}", fatal=False))
+        except Exception as e:  # noqa: BLE001 – e.g. the database is locked: the other steps go on
+            db.rollback()
+            log.exception("reading mail failed")
+            self.reading = f"error: {_message(e)}"
+            self.post(PipelineFailed(f"Reading mail failed: {_message(e)}", fatal=False))
         self.post(Rows(new=True))
         return not self.jobs.closed
 
@@ -360,6 +366,7 @@ class ImportEngine:
                 if not self.jobs.proceed():
                     return False
             except Exception as e:  # noqa: BLE001 – shown; the other steps go on
+                db.rollback()
                 log.exception("merging failed")
                 self.post(PipelineFailed(f"Merging failed: {_message(e)}", fatal=False))
                 return True
@@ -393,6 +400,7 @@ class ImportEngine:
                 self._model_down(f"{MAX_CONSECUTIVE_FAILS} errors in a row. Last error: {e}")
             return True
         except Exception as e:  # noqa: BLE001 – shown; the next document goes on
+            db.rollback()
             log.exception("%s of %s failed", PHASES[phase], sha[:12])
             self.post(PipelineFailed(f"{PHASES[phase]} of {row['filename']}: {_message(e)}", fatal=False))
             return True
@@ -446,6 +454,7 @@ class ImportEngine:
                 try:
                     self._paperless_task(db, task)
                 except Exception as e:  # noqa: BLE001 – shown in the UI; the thread keeps running
+                    db.rollback()
                     if not isinstance(e, PaperlessError):
                         log.exception("%s failed", task[0])
                     if task[0] == "upload":

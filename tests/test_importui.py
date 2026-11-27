@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
 
 from paperclerk.cli import main
+from paperclerk.db import DB
 from paperclerk.decision import evaluate
 from paperclerk.draft import import_corrections, imported
 from paperclerk.importui import Control, ImportApp, ImportDocScreen, plain_steps
+from paperclerk.ingest import ingest_mbox
+from paperclerk.textextract import run_extract
 from paperclerk.ui import Confirm, Help
+from test_merge import split_mbox  # noqa: F401 – fixture
 from test_ui import run, until
 
 INVOICE = "Rechnung_2023_04.pdf"
@@ -214,3 +220,68 @@ def test_import_opens_the_view_only_in_a_terminal(cfg, mbox, monkeypatch):
     assert main(["-c", str(cfg.path), "import", "mbox", str(mbox)]) == 0
     assert len(started) == 1
     assert main(["-c", str(cfg.path), "import", "mbox", "missing.mbox"]) == 1
+
+
+def _write_lock_free(path) -> bool:
+    """Can another connection start writing now? (Retried briefly: another thread may be committing.)"""
+    for _ in range(10):
+        probe = sqlite3.connect(path, timeout=0)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.rollback()
+            return True
+        except sqlite3.OperationalError:
+            time.sleep(0.02)
+        finally:
+            probe.close()
+    return False
+
+
+def test_no_write_lock_is_held_while_waiting_for_a_model_or_paperless(db, cfg, split_mbox, fake_ollama,  # noqa: F811
+                                                                       fake_paperless):
+    """The other threads wait at most DB.TIMEOUT for the write lock, and loading a model takes longer: a
+    transaction left open across a model or Paperless call made uploads and decisions fail."""
+    ingest_mbox(db, cfg, split_mbox)  # already read and with text: the view goes straight to merging
+    run_extract(db, cfg)
+    held = []
+    for fake in (fake_ollama, fake_paperless):
+        def probing(request, handler=fake.handler):
+            if not _write_lock_free(cfg.db_path):
+                held.append(request.url.path)
+            return handler(request)
+        fake.handler = probing
+    app = ImportApp(cfg, "mbox", [split_mbox])
+
+    async def steps(pilot):
+        await until(pilot, settled(app))
+        assert "Vertrag vom 04.11.2026.pdf" in by_name(app)  # merged
+        app.accept_all()
+        await pilot.pause()
+        await pilot.press("y")
+        await until(pilot, lambda: not app.acceptable() and all(not i.saving for i in app.items) and not app.dirty)
+
+    run(app, steps)
+    assert any(d["original_file_name"] == "Vertrag vom 04.11.2026.pdf" for d in fake_paperless.docs.values())
+    assert held == []
+
+
+def test_a_locked_database_does_not_break_later_uploads(db, cfg, mbox, fake_ollama, fake_paperless, monkeypatch):
+    monkeypatch.setattr(DB, "TIMEOUT", 0.2)
+    app = ImportApp(cfg, "mbox", [mbox])
+
+    async def steps(pilot):
+        await until(pilot, settled(app))
+        invoice = by_name(app)[INVOICE]
+        other = sqlite3.connect(cfg.db_path)
+        other.execute("BEGIN IMMEDIATE")  # another thread or program holds the write lock for too long
+        app.engine.load()  # refreshing the vocabulary fails; its error handler then reads the cached names
+        await until(pilot, lambda: "database is locked" in app.load_error)
+        other.execute("INSERT INTO merge_checks(a, b, p) VALUES ('x', 'y', 0.5)")  # it writes and lets go
+
+        other.commit()
+        other.close()
+        app.list_screen.focus_item(invoice.id)
+        await pilot.press("a")  # the failed statement must not have left the Paperless thread unable to write
+        await until(pilot, lambda: invoice.state == "done")
+
+    run(app, steps)

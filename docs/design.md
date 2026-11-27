@@ -486,7 +486,16 @@ One SQLite file, `<data_dir>/paperclerk.sqlite` (WAL mode):
 | `llm_log` | every model call with timing, tokens and raw answer |
 
 Every step commits per document. Interrupting with Ctrl+C loses at most the document in progress; the next
-run continues. Documents whose model call failed three times are skipped (shown by `status` and `show`).
+run continues.
+
+**Short write transactions.** In the terminal UIs several threads share the file, each with its own
+connection, and a writer waits at most 60 s for the lock. So no transaction stays open across a model or
+network call: loading a 27B model takes longer than that. This bit once: reading an MBOX that was already
+complete left a no-op `INSERT OR IGNORE` uncommitted, the merge step then loaded the decider, and the
+Paperless thread's writes timed out. A failed statement also leaves its transaction open; after a later
+read it holds an old snapshot and every further write on that connection fails at once, so the threads
+roll back after any failed step. A test checks during every model and Paperless call that the write lock
+is free. Documents whose model call failed three times are skipped (shown by `status` and `show`).
 
 **Migration from maildocs.** On first start the old `maildocs.sqlite` is copied to `paperclerk.sqlite` (the
 old file stays). German category keys, manual labels (ja/nein), correction keys and skip reasons are

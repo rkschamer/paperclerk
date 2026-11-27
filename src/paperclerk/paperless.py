@@ -228,17 +228,16 @@ class Paperless:
 
 
 def sync_cache(db: DB, pl: Paperless) -> dict[str, list[dict]]:
-    """Read correspondents, document types, tags and custom fields from Paperless into the local cache."""
-    result = {}
-    for kind in KINDS:
-        objs = pl.list_all(kind)
+    """Read correspondents, document types, tags and custom fields from Paperless into the local cache.
+    Everything is fetched first, so the database is not locked while Paperless answers."""
+    result = {kind: pl.list_all(kind) for kind in KINDS}
+    for kind, objs in result.items():
         db.x("DELETE FROM paperless_objects WHERE kind = ?", (kind,))
         for o in objs:
             extra = {"document_count": o.get("document_count"), "is_inbox_tag": o.get("is_inbox_tag", False),
                      "data_type": o.get("data_type")}
             db.x("INSERT OR REPLACE INTO paperless_objects(kind, id, name, extra) VALUES (?, ?, ?, ?)",
                  (kind, o["id"], o["name"], json.dumps(extra)))
-        result[kind] = objs
     db.commit()
     return result
 
@@ -273,5 +272,6 @@ class Registry:
         extra = {"document_count": 0, "data_type": obj.get("data_type")}
         self.db.x("INSERT OR REPLACE INTO paperless_objects(kind, id, name, extra) VALUES (?, ?, ?, ?)",
                   (kind, obj["id"], obj["name"], json.dumps(extra)))
+        self.db.commit()  # not holding the write lock through the next calls to Paperless (e.g. the upload)
         log.info("Paperless: created %s '%s' (id %s)", LABEL[kind], obj["name"], obj["id"])
         return obj["id"]

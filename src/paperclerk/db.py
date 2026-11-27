@@ -168,6 +168,11 @@ def _translate_reason(reason: str) -> str:
 
 
 class DB:
+    """One SQLite connection. The terminal UIs open one per thread; they write in short transactions only,
+    never across a model or network call, because the others wait for the write lock (at most TIMEOUT s)."""
+
+    TIMEOUT = 60
+
     def __init__(self, path: Path, legacy: Path | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() and legacy is not None and legacy.exists():
@@ -177,7 +182,7 @@ class DB:
             src.backup(dst)
             src.close()
             dst.close()
-        self.conn = sqlite3.connect(path, timeout=60)
+        self.conn = sqlite3.connect(path, timeout=self.TIMEOUT)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -233,6 +238,14 @@ class DB:
     def commit(self) -> None:
         self.conn.commit()
 
+    def rollback(self) -> None:
+        """After a failed step: a statement that failed (e.g. "database is locked") leaves the transaction open
+        on an old snapshot, and every later write on this connection would fail at once."""
+        try:
+            self.conn.rollback()
+        except sqlite3.Error:
+            pass
+
     def update_doc(self, sha: str, **values: Any) -> None:
         cols = ", ".join(f"{k} = ?" for k in values)
         self.conn.execute(f"UPDATE documents SET {cols} WHERE sha256 = ?", (*values.values(), sha))
@@ -240,6 +253,7 @@ class DB:
     def source(self, kind: str, locator: str) -> sqlite3.Row:
         self.conn.execute("INSERT OR IGNORE INTO sources(kind, locator, updated_at) VALUES (?, ?, ?)",
                           (kind, locator, now_iso()))
+        self.conn.commit()  # even when nothing was inserted the statement holds the write lock until a commit
         return self.one("SELECT * FROM sources WHERE kind = ? AND locator = ?", (kind, locator))
 
     def set_cursor(self, source_id: int, cursor: str, done: bool = False) -> None:

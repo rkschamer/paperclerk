@@ -224,6 +224,7 @@ class Engine:
                     elif kind == "rerecord" and task[1] in self._written:
                         process.record_written(db, *self._written[task[1]])
                 except Exception as e:  # noqa: BLE001 – shown in the UI; the thread keeps running
+                    db.rollback()  # a failed statement would leave the connection unable to write
                     if not isinstance(e, PaperlessError):
                         log.exception("%s failed", kind)
                     if kind == "load":
@@ -299,6 +300,7 @@ class Engine:
                     ollama = enricher = None
                     self.post(SuggestFailed(doc_id, str(e), fatal=True))
                 except Exception as e:  # noqa: BLE001 – recorded for this document, the next one goes on
+                    db.rollback()
                     if not isinstance(e, (OllamaError, PaperlessError)):
                         log.exception("model call for #%s failed", doc_id)
                     self.post(SuggestFailed(doc_id, _message(e), fatal=False))
