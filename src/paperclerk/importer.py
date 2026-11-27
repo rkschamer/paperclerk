@@ -37,15 +37,21 @@ def source_for(db: DB, cfg: Config, row: Row) -> Source:
     )
 
 
-def _pending_enrich(db: DB, cfg: Config) -> list[Row]:
+def pending_enrich(db: DB, cfg: Config, sha: str | None = None) -> list[Row]:
+    """Documents to import that have no metadata from the current pipeline and model (or only `sha`)."""
     rows = db.q(
         """SELECT * FROM documents
             WHERE skip_reason IS NULL AND part_of IS NULL AND (noul1 IS NOT NULL OR manual = 'yes')
               AND (meta IS NULL OR meta_version IS NULL OR meta_version < ? OR model3 IS NOT ?)
               AND (upload_status IS NULL OR upload_status IN ('failed', 'similar'))
-              AND fail_count < ?
-            ORDER BY rowid""", (VERSION, cfg.enrich.model, MAX_FAILS))
+              AND fail_count < ?""" + (" AND sha256 = ?" if sha else "") + " ORDER BY rowid",
+        (VERSION, cfg.enrich.model, MAX_FAILS, *((sha,) if sha else ())))
     return [r for r in rows if decision(r, cfg) in UPLOAD_DECISIONS]
+
+
+def has_metadata(row: Row, cfg: Config) -> bool:
+    """Metadata from the current pipeline and model (older metadata is determined again)."""
+    return bool(row["meta"]) and row["meta_version"] == VERSION and row["model3"] == cfg.enrich.model
 
 
 def _recent_correspondents(db: DB) -> list[str]:
@@ -55,48 +61,63 @@ def _recent_correspondents(db: DB) -> list[str]:
     return [name for name, _ in counts.most_common() if name]
 
 
+def open_enricher(db: DB, cfg: Config, ollama: Ollama) -> Enricher:
+    """The vocabulary from Paperless (or its cached copy) and the correspondents found earlier in the import."""
+    refresh_vocabulary(db, cfg)
+    ollama.require(cfg.enrich.model)
+    return Enricher(cfg, vocabulary(db, cfg, _recent_correspondents(db)), ollama)
+
+
+def enrich_one(db: DB, cfg: Config, enricher: Enricher, row: Row) -> dict:
+    """Ask the model for the metadata of one document and store it. A failed request is recorded with the
+    document and re-raised."""
+    sha, model = row["sha256"], cfg.enrich.model
+    t0 = time.monotonic()
+    try:
+        suggestion, res = enricher(source_for(db, cfg, row))
+    except OllamaUnavailable:
+        raise
+    except OllamaError as e:
+        db.update_doc(sha, fail_count=row["fail_count"] + 1, last_error=str(e)[:500])
+        db.log_llm(sha, "enrich", model, time.monotonic() - t0, error=str(e)[:2000])
+        db.commit()
+        raise
+    secs = time.monotonic() - t0
+    db.update_doc(sha, meta=json.dumps(suggestion, ensure_ascii=False), meta_version=VERSION, model3=model,
+                  secs3=round(secs, 2), fail_count=0, last_error=None)
+    db.log_llm(sha, "enrich", model, secs, res.input_tokens, res.output_tokens, res.content)
+    db.commit()
+    return suggestion
+
+
 def run_enrich(db: DB, cfg: Config, limit: int | None = None) -> int:
-    rows = _pending_enrich(db, cfg)
+    rows = pending_enrich(db, cfg)
     rows = rows[:limit] if limit else rows
     if not rows:
         return 0
-    refresh_vocabulary(db, cfg)
-    vocab = vocabulary(db, cfg, _recent_correspondents(db))
-    model = cfg.enrich.model
     ollama = Ollama(cfg.ollama.url, cfg.ollama.keep_alive, cfg.ollama.timeout)
     try:
-        ollama.require(model)
-        enricher = Enricher(cfg, vocab, ollama)
-        log.info("Metadata with %s for %d documents (%d known correspondents, %d document types, %d tags)", model,
-                 len(rows), len(vocab.correspondents), len(vocab.document_types), len(vocab.tags))
+        enricher = open_enricher(db, cfg, ollama)
+        vocab = enricher.vocab
+        log.info("Metadata with %s for %d documents (%d known correspondents, %d document types, %d tags)",
+                 cfg.enrich.model, len(rows), len(vocab.correspondents), len(vocab.document_types), len(vocab.tags))
         progress = Progress(len(rows), "Metadata")
         consecutive = 0
         for row in rows:
-            sha = row["sha256"]
             t0 = time.monotonic()
             try:
-                suggestion, res = enricher(source_for(db, cfg, row))
+                s = enrich_one(db, cfg, enricher, row)
             except OllamaUnavailable:
                 raise
             except OllamaError as e:
-                secs = time.monotonic() - t0
                 consecutive += 1
-                db.update_doc(sha, fail_count=row["fail_count"] + 1, last_error=str(e)[:500])
-                db.log_llm(sha, "enrich", model, secs, error=str(e)[:2000])
-                db.commit()
-                progress.step(f"{row['filename']}: ERROR {e}", secs)
+                progress.step(f"{row['filename']}: ERROR {e}", time.monotonic() - t0)
                 if consecutive >= MAX_CONSECUTIVE_FAILS:
                     raise OllamaUnavailable(f"{consecutive} errors in a row – stopping. Last error: {e}")
                 continue
             consecutive = 0
-            secs = time.monotonic() - t0
-            db.update_doc(sha, meta=json.dumps(suggestion, ensure_ascii=False), meta_version=VERSION, model3=model,
-                          secs3=round(secs, 2))
-            db.log_llm(sha, "enrich", model, secs, res.input_tokens, res.output_tokens, res.content)
-            db.commit()
-            s = suggestion
             progress.step(f"{row['filename']}: {s['correspondent'] or '?'} | {s['document_type'] or '-'} | "
-                          f"{s['date']} | {s['title']} | {', '.join(s['tags'])}", secs)
+                          f"{s['date']} | {s['title']} | {', '.join(s['tags'])}", time.monotonic() - t0)
         progress.done()
         return len(rows)
     finally:
@@ -118,7 +139,7 @@ def run_import(db: DB, cfg: Config, source: str, paths: list[Path], dry_run: boo
     if dry_run:
         print()
         preview_upload(db, cfg, limit)
-        print("Dry run: nothing uploaded. Correct the results with `paperclerk review export`/`apply` if needed, "
-              "then run the same command without --dry-run.")
+        print("Dry run: nothing uploaded. Run the same command without --dry-run in a terminal to check, correct "
+              "and upload the documents in the import view.")
         return {}
     return run_upload(db, cfg, limit)

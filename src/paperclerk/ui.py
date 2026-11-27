@@ -45,6 +45,16 @@ from .util import fmt_duration
 
 log = logging.getLogger(__name__)
 
+# Textual 8.2.8 crashes when the mouse is pressed on a toast that was just removed (dismissed by a first click,
+# or timed out): it starts a text selection in a widget that no longer has a parent. Nobody needs to select
+# the text of a toast, so toasts are not selectable; everything else still is.
+try:
+    from textual.widgets._toast import Toast
+
+    Toast.ALLOW_SELECT = False
+except ImportError:  # pragma: no cover – a later Textual moved it (and has hopefully fixed the crash)
+    pass
+
 
 # ---------------------------------------------------------------- messages from the background threads
 
@@ -400,7 +410,9 @@ class UiLog(logging.Handler):
         self.app = app
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.name.startswith("paperclerk"):
+        if getattr(record, "shown", False):  # logged by ReviewApp.notify: it is on the screen already
+            return
+        if record.name.startswith("paperclerk") and record.name != "paperclerk.progress":  # the header shows that
             self.app.post_message(LogLine(record.levelno, record.getMessage()))
 
 
@@ -561,7 +573,7 @@ class View(Screen):
     HINTS: list[tuple[str, str, str | None]] = []
 
     @property
-    def pc(self) -> "ProcessApp":
+    def pc(self) -> "ReviewApp":
         return self.app  # type: ignore[return-value]
 
     def hints(self) -> list[tuple[str, str, bool | None]]:
@@ -624,7 +636,7 @@ class View(Screen):
 
     def action_browser(self) -> None:
         if item := self.selected():
-            webbrowser.open(f"{self.pc.cfg.paperless.url}/documents/{item.id}/details")
+            self.pc.browse(item)
 
     def action_pause(self) -> None:
         self.pc.toggle_pause()
@@ -636,7 +648,7 @@ class View(Screen):
         self.pc.reload()
 
     def action_help(self) -> None:
-        self.app.push_screen(Help(help_text(self.pc.cfg)))
+        self.app.push_screen(Help(self.pc.help_text()))
 
     def action_palette(self) -> None:
         self.app.action_command_palette()
@@ -676,6 +688,8 @@ class ListScreen(View):
              ("o", "Open in Paperless", "browser"), ("/", "Filter", None), ("A", "Accept all", "accept_all"),
              ("p", "Pause model", "pause"), ("f5", "Reload", None), (":", "Commands", None), ("?", "Help", None),
              ("q", "Quit", None)]
+    COLUMNS = LIST_COLUMNS
+    PLACEHOLDER = "filter: words, a status such as ready, or a number – Enter keeps it, Esc clears"
 
     def __init__(self) -> None:
         super().__init__()
@@ -687,10 +701,16 @@ class ListScreen(View):
     def compose(self) -> ComposeResult:
         yield Top()
         with Vertical(id="box"):
-            yield Input(placeholder="filter: words, a status such as ready, or a number – Enter keeps it, Esc clears",
-                        id="filter", compact=True)
+            yield Input(placeholder=self.PLACEHOLDER, id="filter", compact=True)
             yield DataTable(id="docs", cursor_type="row")
         yield Crumbs()
+
+    def key(self, row_key: str) -> int:
+        """The item id behind a table row key."""
+        return int(row_key)
+
+    def doc_screen(self, item_id, focus: str | None = None) -> "DocScreen":
+        return DocScreen(item_id, focus=focus)
 
     def on_mount(self) -> None:
         self.rebuild()
@@ -742,7 +762,7 @@ class ListScreen(View):
         if widths != self.widths:
             self.widths = widths
             table.clear(columns=True)
-            for key, label in LIST_COLUMNS:
+            for key, label in self.COLUMNS:
                 table.add_column(label, width=widths[key], key=key)
         else:
             table.clear()
@@ -768,11 +788,15 @@ class ListScreen(View):
     def update_view(self, item: Item | None = None, rebuild: bool = False) -> None:
         if rebuild or item is None:
             self.rebuild()
-        elif str(item.id) in self.table.rows:
-            for (key, _), cell in zip(LIST_COLUMNS, self._cells(item), strict=True):
-                self.table.update_cell(str(item.id), key, cell)
+        else:
+            self.update_row(item)
         self._title()
         self.refresh_top()
+
+    def update_row(self, item) -> None:
+        if str(item.id) in self.table.rows:
+            for (key, _), cell in zip(self.COLUMNS, self._cells(item), strict=True):
+                self.table.update_cell(str(item.id), key, cell)
 
     def on_resize(self, event: events.Resize) -> None:
         super().on_resize(event)
@@ -794,13 +818,13 @@ class ListScreen(View):
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is not None and event.row_key.value is not None:
-            self.cursor_id = int(event.row_key.value)
+            self.cursor_id = self.key(event.row_key.value)
             self.pc.engine.jobs.preferred = self.cursor_id
             self.refresh_top()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.row_key is not None and event.row_key.value is not None:
-            self.app.push_screen(DocScreen(int(event.row_key.value)))
+            self.app.push_screen(self.doc_screen(self.key(event.row_key.value)))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "filter":
@@ -839,7 +863,7 @@ class ListScreen(View):
         if problem is None:
             self._move_on()
         elif problem in self.pc.labels:  # an invalid value: show it in the form
-            self.app.push_screen(DocScreen(item.id, focus=problem))
+            self.app.push_screen(self.doc_screen(item.id, focus=problem))
 
     def action_reject(self) -> None:
         if item := self.selected():
@@ -867,7 +891,8 @@ class DocScreen(View):
     DocScreen .row .name { width: 16; color: $text-muted; }
     DocScreen .row Input { width: 3fr; }
     DocScreen .row TextArea { width: 3fr; height: 4; }
-    DocScreen .row .was { width: 2fr; max-width: 40; padding-left: 1; color: $text-muted; }
+    DocScreen .row .was { width: 2fr; max-width: 40; padding-left: 1; color: $text-muted; text-wrap: nowrap;
+                          text-overflow: ellipsis; }
     DocScreen .row.changed .name { color: $accent; text-style: bold; }
     DocScreen .row.invalid .name { color: $error; text-style: bold; }
     DocScreen .row.current .name { text-style: bold reverse; }
@@ -894,6 +919,7 @@ class DocScreen(View):
              ("t", "Text only", None), ("p", "Pause model", "pause"), ("?", "Help", None), ("esc", "Back", None)]
     TYPING_HINTS = [("ctrl-s", "Accept", True), ("tab", "Next field", True), ("shift-tab", "Previous field", True),
                     ("→", "Take completion", True), ("esc", "Stop editing", True)]
+    TEXT_TITLE = " Document text "
 
     def __init__(self, doc_id: int, focus: str | None = None):
         super().__init__()
@@ -929,7 +955,7 @@ class DocScreen(View):
             self.widgets[key] = self.query_one(f"#in-{i}")
             self.key_of[f"in-{i}"] = key
             self.row_of[key] = self.query_one(f"#row-{i}", Horizontal)
-        self.query_one("#text-box").border_title = " Document text "
+        self.query_one("#text-box").border_title = self.TEXT_TITLE
         self.show(self.pc.by_id[self.doc_id])
         if self.initial_focus in self.widgets:
             self.widgets[self.initial_focus].focus()
@@ -988,15 +1014,26 @@ class DocScreen(View):
         if not item.editable and self.typing():
             self.query_one("#text-box").focus()
         self.query_one("#heading", Static).update(self._heading(item))
-        self.query_one("#form-box").border_title = f" #{item.id} {_cut(item.doc.get('title') or '', 60)} "
+        self.query_one("#form-box").border_title = self.form_title(item)
+        self.show_text(item, same)
+        if not same:
+            self.query_one("#text-box", VerticalScroll).scroll_home(animate=False)
+        self._decorate(item)
+        self.query_one(Crumbs).show(self.crumbs(item))
+        self.refresh_top()
+
+    def form_title(self, item: Item) -> str:
+        return f" #{item.id} {_cut(item.doc.get('title') or '', 60)} "
+
+    def show_text(self, item: Item, same: bool) -> None:
+        """The panel next to the form; `same`: the document shown has not changed."""
         if not same:
             content = (item.doc.get("content") or "").strip()
             self.query_one("#text", Static).update(
                 content or "(No text in Paperless – the model gets the first page as an image.)")
-            self.query_one("#text-box", VerticalScroll).scroll_home(animate=False)
-        self._decorate(item)
-        self.query_one(Crumbs).show(["documents", f"#{item.id}"])
-        self.refresh_top()
+
+    def crumbs(self, item: Item) -> list[str]:
+        return ["documents", f"#{item.id}"]
 
     def _heading(self, item: Item) -> Text:
         doc = item.doc
@@ -1141,7 +1178,10 @@ class DocScreen(View):
 
 # ---------------------------------------------------------------- the app
 
-class ProcessApp(App[None]):
+class ReviewApp(App[None]):
+    """What both terminal UIs share: a list and a document view over items, an engine with background threads
+    (`engine.jobs` pauses the model and knows the item on screen), writes that quitting waits for."""
+
     TITLE = "paperclerk"
 
     def __init__(self, cfg: Config):
@@ -1149,24 +1189,32 @@ class ProcessApp(App[None]):
         self.cfg = cfg
         self.rows = form_rows(cfg)
         self.labels = dict(self.rows)
-        self.items: list[Item] = []
-        self.by_id: dict[int, Item] = {}
+        self.items: list = []
+        self.by_id: dict = {}
         self.names: dict[str, list[str]] = {}
-        self.engine = Engine(cfg, self.post_message)
-        self.inbox: set[int] = set()
+        self.engine = None  # set by the subclass
         self.loading = True
         self.load_error = ""
         self.model_error = ""
-        self.typical: float | None = None
-        self.durations: list[float] = []
-        self.pending = 0
+        self.pending = 0  # writes on their way
         self.quitting = False
         self.tag_suggester = TagSuggester()
         self.log_handler = UiLog(self)
-        self.list_screen = ListScreen()
+        self.list_screen = self.make_list_screen()
+
+    def make_list_screen(self) -> ListScreen:
+        return ListScreen()
+
+    # Textual calls on_mount/on_unmount of every class in the MRO, so subclasses use these hooks instead
+    def prepare(self) -> None:
+        """Before the list is shown and the engine starts."""
+
+    def cleanup(self) -> None:
+        """After the engine has been told to stop."""
 
     def on_mount(self) -> None:
         logging.getLogger().addHandler(self.log_handler)
+        self.prepare()
         self.push_screen(self.list_screen)
         self.engine.start()
         self.set_interval(1, self._tick)
@@ -1174,6 +1222,116 @@ class ProcessApp(App[None]):
     def on_unmount(self) -> None:
         logging.getLogger().removeHandler(self.log_handler)
         self.engine.stop()
+        self.cleanup()
+
+    def _show_only(self, status: str) -> None:
+        while len(self.screen_stack) > 2:
+            self.pop_screen()
+        box = self.list_screen.query_one("#filter", Input)
+        box.set_class(bool(status), "active")
+        box.value = status  # the filter follows through Input.Changed
+
+    def changed(self, item=None, rebuild: bool = False, source: Screen | None = None) -> None:
+        """State changed: refresh every view (the source view has already updated itself)."""
+        for screen in self.screen_stack:
+            if isinstance(screen, View) and screen.is_mounted:
+                if screen is source:
+                    screen.refresh_top()
+                else:
+                    screen.update_view(item, rebuild)
+
+    def _tick(self) -> None:
+        if isinstance(self.screen, View):
+            self.screen.refresh_top()
+
+    def list_items(self) -> list:
+        """The items in the order of the list, with its filter."""
+        return self.list_screen.rows_shown or self.items
+
+    def next_open(self, after, items: list, with_suggestion: bool = False):
+        """The next item worth looking at: one with a suggestion, else (unless required) any open one."""
+        start = items.index(after) if after in items else -1
+        order = items[start + 1:] + items[:max(start, 0)]
+        found = next((i for i in order if i.open and (i.suggestion is not None or i.edited)), None)
+        if found is None and not with_suggestion:
+            found = next((i for i in order if i.open), None)
+        return found
+
+    def undo(self, item) -> None:
+        if item.edited:
+            item.draft = item.base.copy()
+            self.changed(item)
+
+    def toggle_pause(self) -> None:
+        jobs = self.engine.jobs
+        jobs.pause(not jobs.paused)
+        if not jobs.paused:
+            self.model_error = ""
+        self.notify("Model paused – the document in progress is finished first." if jobs.paused else "Model resumed.")
+        self.changed()
+
+    def unsaved(self) -> list:
+        """Items with edits that quitting would lose; a rejected document is handled already."""
+        return [i for i in self.items if i.edited and i.open]
+
+    async def action_quit(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        edited = self.unsaved()
+        if edited:
+            self.push_screen(Confirm(f"{len(edited)} documents have edits that are not saved. "
+                                     "Quit and lose them?"), lambda yes: self._quit() if yes else None)
+        else:
+            self._quit()
+
+    def _quit(self) -> None:
+        self.quitting = True
+        if self.pending:
+            self.notify(f"Finishing {self.pending} writes to Paperless…")
+        self._finish_quit()
+
+    def _finish_quit(self) -> None:
+        if self.quitting and not self.pending:
+            self.engine.stop()
+            self.exit()
+
+    def notify(self, message: str, *, title: str = "", severity: str = "information", timeout: float | None = None,
+               markup: bool = True) -> None:
+        """Show a notification; warnings and errors also go to the log file, so they can be read after
+        the toast is gone (the background threads report most problems only to the UI)."""
+        if severity in ("warning", "error"):
+            log.log(logging.ERROR if severity == "error" else logging.WARNING, "%s%s", f"{title}: " if title else "",
+                    message, extra={"shown": True})
+        super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
+
+    def on_log_line(self, msg: LogLine) -> None:
+        severity = ("error" if msg.level >= logging.ERROR else "warning" if msg.level >= logging.WARNING
+                    else "information")
+        super().notify(msg.text, severity=severity, markup=False)  # it is in the log file already
+
+    # the parts that differ between the two UIs
+    def help_text(self) -> str:
+        raise NotImplementedError
+
+    def browse(self, item) -> None:
+        raise NotImplementedError
+
+
+class ProcessApp(ReviewApp):
+    """`paperclerk ui`: documents in Paperless that `process` would handle."""
+
+    def __init__(self, cfg: Config):
+        super().__init__(cfg)
+        self.engine = Engine(cfg, self.post_message)
+        self.inbox: set[int] = set()
+        self.typical: float | None = None
+        self.durations: list[float] = []
+
+    def help_text(self) -> str:
+        return help_text(self.cfg)
+
+    def browse(self, item: Item) -> None:
+        webbrowser.open(f"{self.cfg.paperless.url}/documents/{item.id}/details")
 
     def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
         yield from super().get_system_commands(screen)
@@ -1185,13 +1343,6 @@ class ProcessApp(App[None]):
         yield SystemCommand("Pause or resume the model", "Stop asking the model after the current document",
                             self.toggle_pause)
         yield SystemCommand("Reload", "Read the documents from Paperless again", self.reload)
-
-    def _show_only(self, status: str) -> None:
-        while len(self.screen_stack) > 2:
-            self.pop_screen()
-        box = self.list_screen.query_one("#filter", Input)
-        box.set_class(bool(status), "active")
-        box.value = status  # the filter follows through Input.Changed
 
     # -------------------------------------------------------- state shared by the views
 
@@ -1243,32 +1394,6 @@ class ProcessApp(App[None]):
                 out.append("\n")
         return out
 
-    def changed(self, item: Item | None = None, rebuild: bool = False, source: Screen | None = None) -> None:
-        """State changed: refresh every view (the source view has already updated itself)."""
-        for screen in self.screen_stack:
-            if isinstance(screen, View) and screen.is_mounted:
-                if screen is source:
-                    screen.refresh_top()
-                else:
-                    screen.update_view(item, rebuild)
-
-    def _tick(self) -> None:
-        if isinstance(self.screen, View):
-            self.screen.refresh_top()
-
-    def list_items(self) -> list[Item]:
-        """The documents in the order of the list, with its filter."""
-        return self.list_screen.rows_shown or self.items
-
-    def next_open(self, after: Item | None, items: list[Item], with_suggestion: bool = False) -> Item | None:
-        """The next document worth looking at: one with a suggestion, else (unless required) any open one."""
-        start = items.index(after) if after in items else -1
-        order = items[start + 1:] + items[:max(start, 0)]
-        found = next((i for i in order if i.open and (i.suggestion is not None or i.edited)), None)
-        if found is None and not with_suggestion:
-            found = next((i for i in order if i.open), None)
-        return found
-
     def acceptable(self) -> list[Item]:
         return [i for i in self.items if i.open and i.state != "running" and (i.suggestion is not None or i.edited)]
 
@@ -1314,19 +1439,6 @@ class ProcessApp(App[None]):
             self.notify("Queued first – the model is paused, p resumes.")
         self.changed(item)
 
-    def undo(self, item: Item) -> None:
-        if item.edited:
-            item.draft = item.base.copy()
-            self.changed(item)
-
-    def toggle_pause(self) -> None:
-        jobs = self.engine.jobs
-        jobs.pause(not jobs.paused)
-        if not jobs.paused:
-            self.model_error = ""
-        self.notify("Model paused – the document in progress is finished first." if jobs.paused else "Model resumed.")
-        self.changed()
-
     def accept_all(self) -> None:
         ready = self.acceptable()
         if not ready:
@@ -1357,27 +1469,6 @@ class ProcessApp(App[None]):
             self.loading = True
             self.engine.load()
             self.changed()
-
-    async def action_quit(self) -> None:
-        if isinstance(self.screen, ModalScreen):
-            return
-        edited = [i for i in self.items if i.edited and i.open]  # a rejected document is handled already
-        if edited:
-            self.push_screen(Confirm(f"{len(edited)} documents have edits that are not written to Paperless. "
-                                     "Quit and lose them?"), lambda yes: self._quit() if yes else None)
-        else:
-            self._quit()
-
-    def _quit(self) -> None:
-        self.quitting = True
-        if self.pending:
-            self.notify(f"Finishing {self.pending} writes to Paperless…")
-        self._finish_quit()
-
-    def _finish_quit(self) -> None:
-        if self.quitting and not self.pending:
-            self.engine.stop()
-            self.exit()
 
     # -------------------------------------------------------- messages from the background threads
 
@@ -1490,20 +1581,19 @@ class ProcessApp(App[None]):
             self.notify("Quitting was cancelled because a document could not be written.", severity="warning")
         self.changed(item)
 
-    def on_log_line(self, msg: LogLine) -> None:
-        severity = ("error" if msg.level >= logging.ERROR else "warning" if msg.level >= logging.WARNING
-                    else "information")
-        self.notify(msg.text, severity=severity, markup=False)
 
-
-def run_ui(cfg: Config) -> int:
+def run_app(app: App) -> int:
     root = logging.getLogger()
     console = [h for h in root.handlers if type(h) is logging.StreamHandler]  # would write over the screen
     for handler in console:
         root.removeHandler(handler)
     try:
-        ProcessApp(cfg).run()
+        app.run()
     finally:
         for handler in console:
             root.addHandler(handler)
     return 0
+
+
+def run_ui(cfg: Config) -> int:
+    return run_app(ProcessApp(cfg))

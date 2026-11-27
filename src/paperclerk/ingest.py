@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from . import mail, store
 from .config import Config
@@ -117,7 +118,13 @@ class Ingestor:
         record(sha=sha)
 
 
-def ingest_mbox(db: DB, cfg: Config, path: Path, rescan: bool = False, limit: int | None = None) -> IngestStats:
+# Called while reading with the share read so far (None if unknown) and the counts; returning False stops
+# reading (the position is saved). With a callback the reader commits at every call instead of logging.
+OnProgress = Callable[[float | None, IngestStats], bool]
+
+
+def ingest_mbox(db: DB, cfg: Config, path: Path, rescan: bool = False, limit: int | None = None,
+                on_progress: OnProgress | None = None) -> IngestStats:
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"MBOX file not found: {path}")
@@ -138,15 +145,20 @@ def ingest_mbox(db: DB, cfg: Config, path: Path, rescan: bool = False, limit: in
     last = time.monotonic()
     count = 0
     finished = True
+    every = 0.5 if on_progress else 10
     for offset, raw in iter_mbox(path, start):
         ing.handle(src["id"], str(offset), raw)
         count += 1
-        if time.monotonic() - last > 10:
+        if time.monotonic() - last > every:
             db.set_cursor(src["id"], str(offset))
             db.commit()
             last = time.monotonic()
-            log.info("  %5.1f %%  %d mails, %d new documents", 100 * offset / max(total, 1), ing.stats.messages,
-                     ing.stats.new_docs)
+            if on_progress is None:
+                log.info("  %5.1f %%  %d mails, %d new documents", 100 * offset / max(total, 1), ing.stats.messages,
+                         ing.stats.new_docs)
+            elif not on_progress(offset / max(total, 1), ing.stats):
+                finished = False
+                break
         if limit and count >= limit:
             db.set_cursor(src["id"], str(offset))
             finished = False
@@ -162,7 +174,8 @@ def _imap_labels(raw: str) -> str:
     return ",".join((a or b).replace("\\\\", "\\").lstrip("\\") for a, b in tokens)
 
 
-def ingest_imap(db: DB, cfg: Config, limit: int | None = None, rescan: bool = False) -> IngestStats:
+def ingest_imap(db: DB, cfg: Config, limit: int | None = None, rescan: bool = False,
+                on_progress: OnProgress | None = None) -> IngestStats:
     c = cfg.imap
     imap = GmailImap(c.host, c.user, c.password, c.folder)
     imap.connect()
@@ -177,13 +190,17 @@ def ingest_imap(db: DB, cfg: Config, limit: int | None = None, rescan: bool = Fa
                 log.warning("UIDVALIDITY changed – checking all mails again")
         ing = Ingestor(db, cfg)
         last = time.monotonic()
+        every = 0.5 if on_progress else 10
         for n, (uid, raw, labels) in enumerate(imap.iter_messages(c.query, after), 1):
             ing.handle(src["id"], f"{imap.uidvalidity}:{uid}", raw, _imap_labels(labels))
             db.set_cursor(src["id"], f"{imap.uidvalidity}:{uid}")
-            if time.monotonic() - last > 10:
+            if time.monotonic() - last > every:
                 db.commit()
                 last = time.monotonic()
-                log.info("  %d mails, %d new documents", ing.stats.messages, ing.stats.new_docs)
+                if on_progress is None:
+                    log.info("  %d mails, %d new documents", ing.stats.messages, ing.stats.new_docs)
+                elif not on_progress(None, ing.stats):
+                    break
             if limit and n >= limit:
                 break
         db.commit()

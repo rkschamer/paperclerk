@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 
-import openpyxl
 import pytest
 
 from conftest import TESSDATA
 from paperclerk.cli import main
+from paperclerk.decision import state
+from paperclerk.draft import Draft, import_corrections, imported
 from paperclerk.importer import run_import
 from paperclerk.ingest import ingest_mbox
-from paperclerk.review import apply_review, export_review, state
 from paperclerk.textextract import run_extract
 
 
@@ -36,7 +36,7 @@ def test_text_extraction(db, cfg, mbox):
 
 
 @pytest.mark.skipif(not TESSDATA, reason="PAPERCLERK_TEST_TESSDATA not set")
-def test_full_import(db, cfg, mbox, fake_ollama, fake_paperless, tmp_path, capsys):
+def test_full_import(db, cfg, mbox, fake_ollama, fake_paperless, capsys):
     assert run_import(db, cfg, "mbox", [mbox], dry_run=True) == {}
     assert not fake_paperless.created and "would be uploaded" in capsys.readouterr().out
     docs = _by_name(db)
@@ -64,21 +64,14 @@ def test_full_import(db, cfg, mbox, fake_ollama, fake_paperless, tmp_path, capsy
     assert meta["fields"] == {"Betrag": "EUR44.15", "Rechnungsnummer": "4400 1234 5678", "Fällig am": "2023-04-28"}
     assert meta["tags"] == ["Telekommunikation", "Mobilfunk"] and meta["summary"]
 
-    # review: one correction and one manual decision
-    xlsx = tmp_path / "review.xlsx"
-    assert export_review(db, cfg, xlsx) == 12
-    wb = openpyxl.load_workbook(xlsx)
-    ws = wb["Documents"]
-    header = [c.value for c in ws[1]]
-    for row in ws.iter_rows(min_row=2):
-        name = row[header.index("File name")].value
-        if name == "Rechnung_2023_04.pdf":
-            row[header.index("Correspondent")].value = "Telekom"
-        if name == "Datenschutz.pdf":
-            row[header.index("Manual")].value = "yes"
-    wb.save(xlsx)
-    stats = apply_review(db, cfg, xlsx)
-    assert stats["corrected fields"] == 1 and stats["manual: yes"] == 1
+    # decisions as the import view stores them: a correction and a document the model dropped
+    inv, privacy = docs["Rechnung_2023_04.pdf"], docs["Datenschutz.pdf"]
+    corrections, errors = import_corrections(inv, Draft(**{**imported(inv, cfg).__dict__, "correspondent": "Telekom"}),
+                                             cfg)
+    assert corrections == {"correspondent": "Telekom"} and not errors
+    db.update_doc(inv["sha256"], overrides=json.dumps(corrections))
+    db.update_doc(privacy["sha256"], manual="yes")
+    db.commit()
 
     counts = run_import(db, cfg, "mbox", [mbox])  # nothing new to read; enrich Datenschutz.pdf, upload
     assert counts["done"] == 7 and counts["failed"] == 0

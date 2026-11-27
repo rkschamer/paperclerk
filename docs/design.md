@@ -13,8 +13,9 @@ workstation the tool runs on: RTX 3070 Ti (8 GB), 32 GB RAM, Windows 11, Ollama 
 | Topic | Decision | Section |
 | --- | --- | --- |
 | Where the models run | On the GPU workstation, not in the cluster; the tool talks to Paperless over its API | 4 |
-| Commands | `init`, `check`, `import mbox/imap`, `process`, `ui`, `review`, `status`, `show` – nothing else until needed | 3 |
+| Commands | `init`, `check`, `import mbox/imap`, `process`, `ui`, `status`, `show` – nothing else until needed | 3 |
 | Interactive review | `paperclerk ui`: a k9s-style terminal UI over `process`; the form is what gets written | 6.5 |
+| Import review | `import` in a terminal opens an import view: every step visible, nothing uploaded until accepted; replaces the spreadsheet | 7.8 |
 | One pipeline | `import` and `process` share one enrichment step; only `import` scores relevance first | 5 |
 | One model call per document | A single generative call returns all metadata as JSON, constrained by a schema | 5 |
 | Vocabulary | Paperless' existing objects plus configured document types and tags; new tags allowed (≤ 3) | 5.2 |
@@ -49,12 +50,13 @@ paperclerk import mbox FILE...       import mail attachments from a Google Takeo
 paperclerk import imap               the same directly from Gmail
 paperclerk process                   enrich Paperless documents that have not been processed yet
 paperclerk ui                        the same interactively: check, edit and accept suggestions
-paperclerk review export|apply [F]   check and correct import results in a spreadsheet
 paperclerk status                    progress
 paperclerk show ID                   one imported document (hash prefix) or Paperless document (number)
 ```
 
 `import` and `process` take `--dry-run` (everything except writing to Paperless) and `-n N` (test runs).
+In a terminal, `import` opens the import view (7.8); with `--dry-run`, or when its output is not a
+terminal, it runs without it.
 
 - **Name.** *paperclerk*: a clerk does the paperwork for Paperless. Alternatives considered: *filer*,
   *archivist*.
@@ -65,8 +67,13 @@ paperclerk show ID                   one imported document (hash prefix) or Pape
   `decide`, `escalate`, `meta`, `upload`, `sync`) run in order inside `import`. Every step only handles what
   is still open, so running the same command again simply continues. `--dry-run` stops before the upload;
   running the command again without it uploads.
-- **Removed:** `setup-ocr` (part of `init`), `evaluate` (printed by `review apply`), `files`, `reset`,
-  manual `merge`/`unmerge`, `upload --retry-failed` (failed uploads are retried automatically).
+- **The import view is `import` itself, not a second command.** `process` has `ui` next to it because
+  `process` is also run unattended on its own. For imports the interactive run is the normal case, so the
+  same command opens the view whenever a person is at the terminal (standard input and output are a
+  terminal). Scheduled IMAP imports, whose output goes to a file, keep running unattended without a flag.
+- **Removed:** `setup-ocr` (part of `init`), `evaluate` (the threshold report is in the import view's
+  command palette), `review export/apply` (replaced by the import view, 7.8), `files`, `reset`, manual
+  `merge`/`unmerge`, `upload --retry-failed` (failed uploads are retried automatically).
 
 ## 4. Architecture
 
@@ -109,7 +116,9 @@ vocabulary and for whether a document has been processed.
 - **Output length is the cost driver.** Fields and summary roughly quadruple the output compared with
   title/correspondent/date only (~50 tokens, ~7 s). `summary = false` saves about a fifth.
 - **Phases, not interleaving.** Each step runs for all pending documents before the next one starts, so
-  each model is loaded once per run instead of swapping per document.
+  each model is loaded once per run instead of swapping per document. The import view keeps the phases; it
+  only reorders within one (the document on screen first). A document the user asks for (`g`, or `a` on one
+  without metadata) gets all its steps at once and may cost a model swap – the user is waiting for it.
 - **Faster alternative.** `qwen3.6:35b` (MoE, ~3B active parameters) needed 4–5 s per document for the
   same output (~5× faster) with nearly identical results on the sample set; it was a little weaker on
   details (a painter's invoice tagged "Arbeit" instead of "Wohnung", fewer due dates found). It needs
@@ -280,6 +289,11 @@ the UI, and documents accepted or rejected in the UI are not touched by `process
   raise the question of what `process` should do with them; nobody needed that yet.
 - **Textual** as the UI library: Python's `curses` does not exist on Windows, and Textual runs in Windows
   Terminal, brings inputs with completion, tables and dialogs, and can be driven headless in tests.
+  Toasts are not text-selectable: Textual 8.2.8 crashed when the mouse was pressed on a toast that had just
+  been dismissed or had timed out.
+- **Every warning or error shown is also logged** (`<data_dir>/paperclerk.log`). The background threads
+  report many problems (Paperless or Ollama unreachable, failed uploads) only to the UI; a toast disappears
+  after a few seconds, the log line stays.
 
 ## 7. `import`: mail attachments
 
@@ -342,8 +356,8 @@ document lands in the middle, which is the case worth a second look.
 | --- | --- |
 | ≥ 0.75 (`accept`) | imported |
 | ≤ 0.15 (`reject`) | not imported (file and mail link kept) |
-| between | escalation model if configured, otherwise imported with the review tag |
-| manual yes/no (review sheet) | always wins |
+| between | escalation model if configured, then *uncertain*: the user decides in the import view; an unattended run imports it with the review tag |
+| the user's decision (accept / reject in the import view) | always wins |
 
 Asymmetric thresholds: wrongly dropping a document is worse than importing one too many. The probabilities
 are stored raw, so changed thresholds or category flags take effect without asking the model again. Sample
@@ -373,12 +387,53 @@ task succeeds, custom fields are set with a PATCH and the note is added (summary
 relevance). Setting them afterwards works with every API version. Unfinished tasks and missing notes are
 picked up by the next run.
 
-### 7.8 Review
+### 7.8 The import view
 
-`review export` writes all imported documents into a spreadsheet: state, relevance, metadata, link to the
-file, mail, text excerpt. The user fills in "Manual" (yes/no) and corrects fields; `review apply` reads the
-changes back (detected against hidden copies of the original values) and prints how the thresholds perform
-against the manual labels.
+`import` in a terminal opens a view in the style of `paperclerk ui` (6.5): header with the state and keys,
+a list with a filter, Enter opens a document, Esc goes back. Its purpose is to follow every step of the
+import and to decide what gets uploaded. It replaces the spreadsheet round trip (`review export`, edit,
+`review apply`), which was slow and showed neither the document's text nor how a decision came about.
+
+- **The same steps, phase by phase.** A pipeline thread runs what the plain `import` runs – read the mail,
+  text, merge, relevance, escalation, metadata – through the same per-document functions, phase by phase
+  (4.1). It reads the database's pending lists, so it continues wherever the last run stopped and needs no
+  state of its own. When everything is done it waits for the user's next decision.
+- **Nothing is uploaded until accepted.** The model's decision is a proposal, as the suggestion is in
+  `process`. *Accept* (`a`) stores the user's decision (`manual = yes`) and the form's corrections and
+  uploads with the plain upload code (duplicate checks, task, fields, note). *Reject* (`x`) stores
+  `manual = no`. `a` on a document without metadata (the model dropped it, or it has not got there yet)
+  stores `manual = yes` and asks the model for the metadata at once; the user checks it and accepts
+  again, so nothing is uploaded unseen.
+- **Accept all leaves the uncertain ones.** `A` uploads every *ready* document (the model or the user
+  says import, metadata present). Documents between the thresholds (*uncertain*) are exactly the ones
+  worth a look, so they are left for one-by-one checks; the confirmation says how many.
+- **Accepting is the review.** An accepted document is uploaded without the review tag, even if the model
+  was unsure: the user has looked at it. The review tag remains for unattended runs, which upload uncertain
+  documents as before.
+- **Corrections are stored, not the form.** The form starts with the model's metadata plus earlier
+  corrections; on accept every value that differs from the model's is stored in `overrides`, which the
+  upload takes first. If a document has no metadata from the current pipeline and model, all form values
+  are stored, so outdated metadata cannot fill the gaps.
+- **Every step is shown.** The document view puts a trail next to the form: the mail (sender, subject,
+  attachment name, other mails with the same file), the file, how the text was read (PDF text, OCR, none:
+  the models get an image), merging (parts and continuation probabilities, or "kept separate" with the
+  answer), relevance (score, yes/no answer, top categories, model and time), escalation, the decision with
+  the threshold that made it, the metadata (model, time, the correspondent as written, whether the mail
+  date stood in, the user's corrections) and the upload (Paperless id, duplicate found, error). Below it
+  the document's text; `o` opens the file. Failed steps show their error.
+- **The list shows mail data until there is metadata.** Title, correspondent and date columns fall back
+  to the mail's subject, sender and date (dimmed), so documents can be judged before the metadata model
+  has run. REL shows the model's relevance, coloured by its decision.
+- **Two threads, the UI only reads.** The pipeline thread writes results; a second thread talks to
+  Paperless (vocabulary, uploads, task polling) and also stores the user's decisions, so the UI thread
+  never waits for the network or a write lock (reading the mail holds one between commits). The UI reads
+  changed rows itself (SQLite in WAL mode: readers do not block) and applies the threads' reports in
+  batches four times a second, because reading the mail adds documents faster than a table should be
+  rebuilt. With the view, reading commits every half second instead of every ten, so new documents appear.
+- **Threshold report in the command palette.** Every accept and reject is a label. "Check the relevance
+  thresholds" shows how the thresholds would do against them (formerly printed by `review apply`).
+- **Not built yet:** a view of the mails themselves (which attachments were filtered out as logos or
+  inline images is only counted in `status`); undoing a decision other than by the opposite one.
 
 ## 8. Paperless integration
 
@@ -388,7 +443,7 @@ against the manual labels.
 | --- | --- | --- |
 | `paperclerk` (processed tag) | import and process | marks enriched documents; remove to re-process |
 | `mail-import` (import tags) | import | origin |
-| `paperclerk-review` (review tag) | import | relevance uncertain |
+| `paperclerk-review` (review tag) | unattended import | relevance uncertain (in the import view the user decides instead) |
 | content tags | import and process | topic |
 | inbox tags (here `new`, `paperless-gpt`) | Paperless | not reviewed yet: `process` picks these documents; accepting in `ui` removes the tags |
 
@@ -424,7 +479,7 @@ One SQLite file, `<data_dir>/paperclerk.sqlite` (WAL mode):
 | Table | Content |
 | --- | --- |
 | `sources`, `messages`, `attachments` | mail sources with cursors, mails with attachments, every attachment incl. why it was dropped |
-| `documents` | one row per unique imported file or merged document: text, model answers, suggestion, corrections, upload state |
+| `documents` | one row per unique imported file or merged document: text, model answers, suggestion, the user's decision (`manual`) and corrections (`overrides`), upload state |
 | `merge_checks` | answers to "does B continue A?" |
 | `processed` | Paperless documents handled by `process` or `ui`: suggestion, status (suggested, applied, rejected, failed), written changes, note id |
 | `paperless_objects` | cache of correspondents, document types, tags, custom fields |
@@ -469,6 +524,12 @@ so typos do not silently fall back to defaults. Secrets can come from `PAPERLESS
 - **Only existing document types and tags:** too restrictive for an instance with one document type.
 - **A spreadsheet for `process` as for imports:** the round trip (export, edit, apply) is slow for a few
   new documents a week; the terminal UI shows text and suggestion together and writes at once.
+- **A spreadsheet for imports** (`review export/apply`, the first approach): replaced by the import view
+  (7.8) for the same reasons, and because the spreadsheet showed neither the text nor the steps behind a
+  decision.
+- **Uploading relevant documents automatically in the import view,** as the unattended run does: the view
+  exists to check before anything reaches Paperless, as `ui` does for `process`; `A` keeps bulk accepting
+  one key.
 - **`curses`, urwid or prompt_toolkit for the UI:** `curses` is missing on Windows; the other two would
   need the table, completion and dialogs built by hand. Textual has them and can be tested headless.
 

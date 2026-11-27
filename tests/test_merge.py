@@ -7,10 +7,10 @@ import json
 import pymupdf
 import pytest
 
+from paperclerk.decision import state
 from paperclerk.importer import run_import
 from paperclerk.ingest import ingest_mbox
 from paperclerk.merge import run_merge, split_name
-from paperclerk.review import state
 from paperclerk.scoring import run_scoring
 from paperclerk.textextract import run_extract
 from paperclerk.upload import run_upload

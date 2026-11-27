@@ -13,6 +13,7 @@ import pymupdf
 import pytest
 
 import paperclerk.importer
+import paperclerk.importui
 import paperclerk.merge
 import paperclerk.process
 import paperclerk.scoring
@@ -140,7 +141,8 @@ def fake_ollama(monkeypatch):
     def factory(*args, **kwargs):
         return Ollama(*args, transport=httpx.MockTransport(fake.handler), **kwargs)
 
-    for module in (paperclerk.scoring, paperclerk.importer, paperclerk.merge, paperclerk.process):
+    for module in (paperclerk.scoring, paperclerk.importer, paperclerk.merge, paperclerk.process,
+                   paperclerk.importui):
         monkeypatch.setattr(module, "Ollama", factory)
     return fake
 

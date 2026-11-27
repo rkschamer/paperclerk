@@ -1,10 +1,13 @@
-"""The form of `paperclerk ui`: the values a Paperless document will have after accepting.
+"""The forms of the terminal UIs: the values a document will have after accepting.
 
-A draft starts as the document's current values with the model's suggestion applied according to the
-write policy of `process` (section 6.2 of docs/design.md) and, with `[process] remove_inbox_tags`, without
-the inbox tags, because accepting means the user has reviewed the document. Whatever the user then types
-wins: the changes are computed against the document as loaded and written with
-`process.apply(overwrite=True)`.
+`paperclerk ui` (documents in Paperless): a draft starts as the document's current values with the model's
+suggestion applied according to the write policy of `process` (section 6.2 of docs/design.md) and, with
+`[process] remove_inbox_tags`, without the inbox tags, because accepting means the user has reviewed the
+document. Whatever the user then types wins: the changes are computed against the document as loaded and
+written with `process.apply(overwrite=True)`.
+
+`paperclerk import` (mail attachments): a draft starts as the model's metadata with earlier corrections;
+what the user changes is stored as corrections, which the upload takes before the model's values.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import copy
 from dataclasses import dataclass, field
 
 from .config import Config
+from .decision import meta, overrides
 from .normalize import clean, parse_date, parse_field
 from .paperless import Registry
 from .process import plan
@@ -159,6 +163,58 @@ def changes_for(cur: Draft, draft: Draft, cfg: Config) -> tuple[dict, dict[str, 
     if note := draft.note.strip():
         out["note"] = note
     return out, errors
+
+
+# ---------------------------------------------------------------- imported documents (`paperclerk import`)
+
+def imported(row, cfg: Config, with_meta: bool = True, with_corrections: bool = True) -> Draft:
+    """The form of an imported document: the model's metadata (with_meta) with the user's corrections."""
+    model = meta(row) if with_meta else {}
+    over = overrides(row) if with_corrections else {}
+
+    def get(name: str, default):
+        value = over[name] if name in over else model.get(name)
+        return default if value is None else value
+
+    fields = get("fields", {})
+    return Draft(title=get("title", ""), correspondent=get("correspondent", ""),
+                 document_type=get("document_type", ""), date=get("date", ""), tags=list(get("tags", [])),
+                 fields={f.name: field_text(fields.get(f.name)) for f in cfg.fields}, note=get("summary", ""))
+
+
+def import_corrections(row, draft: Draft, cfg: Config, with_meta: bool = True) -> tuple[dict, dict[str, str]]:
+    """The corrections to store for an imported document – every form value that differs from the model's –
+    and error messages by form key. The upload takes a correction before the model's value."""
+    errors: dict[str, str] = {}
+    title = clean(draft.title)
+    if not title:
+        errors["title"] = "must not be empty"
+    text = clean(draft.date)
+    day = parse_date(text) if text else None
+    if text and day is None:
+        errors["date"] = "use a date such as 2023-04-28 or 28.04.2023"
+    types = {f.name: f.type for f in cfg.fields}
+    fields: dict = {}
+    for name, raw in draft.fields.items():
+        text = clean(raw)
+        if not text:
+            continue
+        kind = types.get(name, "string")
+        value = parse_field(kind, text)
+        if value is None:
+            errors[f"field:{name}"] = f"expected {HINTS.get(kind, 'text')}"
+        else:
+            fields[name] = value
+    values = {"title": title[:128], "correspondent": clean(draft.correspondent),
+              "document_type": clean(draft.document_type), "date": day.isoformat() if day else "",
+              "tags": list(draft.tags), "fields": fields, "summary": draft.note.strip()}
+    if not with_meta:  # no (current) metadata: every value is the user's, or older metadata would fill gaps
+        return values, errors
+    model = meta(row)
+    defaults = {"tags": [], "fields": {}}
+    corrections = {key: value for key, value in values.items()
+                   if value != (model.get(key) if model.get(key) is not None else defaults.get(key, ""))}
+    return corrections, errors
 
 
 def changed_keys(changes: dict) -> set[str]:

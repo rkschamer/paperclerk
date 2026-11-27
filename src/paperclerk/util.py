@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-log = logging.getLogger("paperclerk")
+log = logging.getLogger("paperclerk.progress")  # its own name, so the terminal UIs can leave it out
 
 
 def fmt_duration(secs: float) -> str:

@@ -129,7 +129,7 @@ class TextExtractor:
             return self._image(path)
         if kind == "office":
             return self._office(path, ext)
-        return TextResult(skip_reason=f"unbekannte Art {kind}")
+        return TextResult(skip_reason=f"unknown kind {kind}")
 
     def _finish(self, text: str, pages: int | None, method: str) -> TextResult:
         text = compact(text)
@@ -242,30 +242,39 @@ class TextExtractor:
         return self._finish(text, None, "office")
 
 
+def pending_extract(db: DB, sha: str | None = None, limit: int | None = None) -> list:
+    """Documents without text yet (or only `sha`, if it is one of them)."""
+    return db.q(
+        "SELECT sha256, kind, ext, path, size, filename FROM documents WHERE text_method IS NULL AND skip_reason IS NULL"
+        + (" AND sha256 = ?" if sha else "") + " ORDER BY rowid" + (f" LIMIT {int(limit)}" if limit else ""),
+        (sha,) if sha else ())
+
+
+def extract_one(db: DB, cfg: Config, ex: TextExtractor, row) -> TextResult:
+    """Text of one stored file, saved with the document (or why it is skipped)."""
+    if row["kind"] not in cfg.imports.kinds:
+        res = TextResult(skip_reason=f"kind '{row['kind']}' disabled")
+    elif row["size"] > cfg.imports.max_file_mb * 1024 * 1024:
+        res = TextResult(skip_reason=f"larger than {cfg.imports.max_file_mb} MB")
+    else:
+        res = ex.extract(cfg.files_dir / row["path"], row["kind"], row["ext"])
+    if res.skip_reason:
+        db.update_doc(row["sha256"], skip_reason=res.skip_reason)
+    else:
+        db.update_doc(row["sha256"], text=res.text, pages=res.pages, text_method=res.method)
+    db.commit()
+    return res
+
+
 def run_extract(db: DB, cfg: Config, limit: int | None = None) -> int:
-    rows = db.q(
-        """SELECT sha256, kind, ext, path, size, filename FROM documents
-            WHERE text_method IS NULL AND skip_reason IS NULL ORDER BY rowid"""
-        + (f" LIMIT {int(limit)}" if limit else "")
-    )
+    rows = pending_extract(db, limit=limit)
     if not rows:
         return 0
     ex = TextExtractor(cfg)
     progress = Progress(len(rows), "Text")
-    max_bytes = cfg.imports.max_file_mb * 1024 * 1024
     for row in rows:
         t0 = time.monotonic()
-        if row["kind"] not in cfg.imports.kinds:
-            res = TextResult(skip_reason=f"kind '{row['kind']}' disabled")
-        elif row["size"] > max_bytes:
-            res = TextResult(skip_reason=f"larger than {cfg.imports.max_file_mb} MB")
-        else:
-            res = ex.extract(cfg.files_dir / row["path"], row["kind"], row["ext"])
-        if res.skip_reason:
-            db.update_doc(row["sha256"], skip_reason=res.skip_reason)
-        else:
-            db.update_doc(row["sha256"], text=res.text, pages=res.pages, text_method=res.method)
-        db.commit()
+        res = extract_one(db, cfg, ex, row)
         info = res.skip_reason or f"{res.method}, {len(res.text)} chars"
         progress.step(f"{row['filename']}: {info}", time.monotonic() - t0, quiet=True)
     progress.done()

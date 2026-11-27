@@ -176,19 +176,25 @@ class Uploader:
         except PaperlessError as e:
             log.warning("Custom fields/note for Paperless #%s not set (retried next run): %s", row["paperless_id"], e)
 
-    def poll(self) -> None:
+    def poll(self) -> list[str]:
+        """Check the tasks waiting in Paperless; returns the documents whose task has finished."""
+        finished = []
         for task_id, sha in list(self.pending.items()):
             info = self.pl.task(task_id)
             if info is not None and info.finished:
                 del self.pending[task_id]
                 self._finish(sha, info)
+                finished.append(sha)
+        return finished
 
-    def wait(self, max_pending: int, timeout: float = 900) -> None:
+    def wait(self, max_pending: int, timeout: float = 900) -> list[str]:
         deadline = time.monotonic() + timeout
+        finished = []
         while len(self.pending) > max_pending and time.monotonic() < deadline:
-            self.poll()
+            finished += self.poll()
             if len(self.pending) > max_pending:
                 time.sleep(3)
+        return finished
 
     def existing(self, row: Row) -> tuple[str, int, str] | None:
         """(status, Paperless id, reason) if Paperless already has the document."""
@@ -232,12 +238,14 @@ class Uploader:
         self.pending[task_id] = sha
         return f"uploaded: {plan.title} | {plan.correspondent or '-'} | {plan.document_type or '-'}"
 
-    def catch_up(self) -> None:
-        """Earlier runs: finished tasks and missing notes/custom fields."""
-        self.poll()
+    def catch_up(self) -> list[str]:
+        """Earlier runs: finished tasks and missing notes/custom fields. Returns the documents that changed."""
+        changed = self.poll()
         for r in self.db.q("SELECT sha256 FROM documents WHERE upload_status = 'done' AND note_added = 0"):
             self.complete(r["sha256"])
+            changed.append(r["sha256"])
         self.db.commit()
+        return changed
 
 
 def preview_upload(db: DB, cfg: Config, limit: int | None = None) -> None:

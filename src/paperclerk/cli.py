@@ -15,12 +15,11 @@ import httpx
 from . import __version__
 from .config import LEGACY_SECTIONS, Config, ConfigError, convert_legacy, load, template_text
 from .db import DB
-from .decision import UPLOAD_DECISIONS, category_key, meta, overrides, probability, type_probs
+from .decision import PART, UPLOAD_DECISIONS, category_key, meta, overrides, probability, state, type_probs
 from .importer import run_import
 from .ollama import Ollama, OllamaError, OllamaUnavailable
 from .paperless import Paperless, PaperlessError, sync_cache
 from .process import run_process
-from .review import PART, apply_review, evaluate, export_review, state
 from .sources import GmailImap, ImapError
 from .upload import build_plan
 from .util import fmt_duration, setup_logging
@@ -146,8 +145,20 @@ def cmd_check(args: argparse.Namespace, db: DB, cfg: Config) -> int:
 
 # ---------------------------------------------------------------- import / process
 
+def interactive() -> bool:
+    """A person is watching: the terminal UI can run (not with redirected output, e.g. a scheduled task)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def cmd_import(args: argparse.Namespace, db: DB, cfg: Config) -> int:
     paths = [Path(p) for p in getattr(args, "files", [])]
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"MBOX file not found: {path.resolve()}")
+    if interactive() and not args.dry_run:
+        from .importui import run_import_ui  # noqa: PLC0415 – Textual is only loaded for the UI
+
+        return run_import_ui(cfg, args.source, paths, args.limit)
     counts = run_import(db, cfg, args.source, paths, args.dry_run, args.limit)
     if counts:
         print("Upload: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
@@ -167,21 +178,6 @@ def cmd_ui(args: argparse.Namespace, db: DB, cfg: Config) -> int:
     from .ui import run_ui  # noqa: PLC0415 – Textual is only loaded for the UI
 
     return run_ui(cfg)
-
-
-def cmd_review(args: argparse.Namespace, db: DB, cfg: Config) -> int:
-    path = Path(args.file) if args.file else cfg.data_dir / "review.xlsx"
-    if args.action == "export":
-        n = export_review(db, cfg, path)
-        print(f"Exported {n} documents to {path}.\nFill in 'Manual' (yes/no), correct document type, correspondent, "
-              f"date, title or tags if needed, save, then run: paperclerk review apply \"{path}\"")
-        return 0
-    stats = apply_review(db, cfg, path)
-    print("Applied: " + ", ".join(f"{k} {v}" for k, v in stats.items()))
-    report = evaluate(db, cfg)
-    if report:
-        print(report)
-    return 0
 
 
 # ---------------------------------------------------------------- status / show
@@ -310,23 +306,22 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(func=func)
         return sp
 
-    def run_options(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--dry-run", action="store_true", help="do everything except writing to Paperless")
+    def run_options(sp: argparse.ArgumentParser, dry_run: str = "do everything except writing to Paperless") -> None:
+        sp.add_argument("--dry-run", action="store_true", help=dry_run)
         sp.add_argument("-n", "--limit", type=int, help="at most N documents (for test runs)")
 
     add("init", None, "create config.toml (or convert a maildocs one) and download OCR data")
     add("check", cmd_check, "check configuration, Ollama models, Paperless and IMAP")
-    imp = add("import", cmd_import, "import mail attachments into Paperless")
+    imp = add("import", cmd_import, "import mail attachments into Paperless; in a terminal this opens the import "
+              "view, where you follow every step and accept what gets uploaded")
     sources = imp.add_subparsers(dest="source", required=True, metavar="source")
     mbox = add("mbox", cmd_import, "Google Takeout MBOX file(s)", sources)
     mbox.add_argument("files", nargs="+", help="MBOX file(s)")
-    run_options(mbox)
-    run_options(add("imap", cmd_import, "Gmail via IMAP ([imap] in the configuration)", sources))
+    no_view = "do everything except uploading, without the import view; print what would be uploaded"
+    run_options(mbox, no_view)
+    run_options(add("imap", cmd_import, "Gmail via IMAP ([imap] in the configuration)", sources), no_view)
     run_options(add("process", cmd_process, "enrich Paperless documents paperclerk has not processed yet"))
     add("ui", cmd_ui, "check, edit and accept the suggestions of `process` in a terminal UI")
-    review = add("review", cmd_review, "check and correct import results in a spreadsheet")
-    review.add_argument("action", choices=("export", "apply"), help="export: write the sheet; apply: read it back")
-    review.add_argument("file", nargs="?", help="spreadsheet (default: <data_dir>/review.xlsx)")
     add("status", cmd_status, "progress of imports and processing")
     show = add("show", cmd_show, "details of an imported document (ID) or a processed Paperless document (number)")
     show.add_argument("id")

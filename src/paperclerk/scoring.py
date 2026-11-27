@@ -121,30 +121,59 @@ class Scorer:
         return noul, probs, (res.get("usage") or {}).get("input_tokens")
 
 
-def _pending(db: DB, cfg: Config, stage: str) -> list[Row]:
+def pending(db: DB, cfg: Config, stage: str, sha: str | None = None) -> list[Row]:
+    """Documents waiting for relevance (stage "score") or for a second opinion ("escalate")."""
+    one, params = (" AND sha256 = ?", (MAX_FAILS, sha)) if sha else ("", (MAX_FAILS,))
     if stage == "score":
         return db.q(
-            """SELECT * FROM documents
+            f"""SELECT * FROM documents
                 WHERE text_method IS NOT NULL AND skip_reason IS NULL AND part_of IS NULL AND noul1 IS NULL
-                  AND fail_count < ?
-                ORDER BY rowid""", (MAX_FAILS,))
+                  AND fail_count < ?{one}
+                ORDER BY rowid""", params)
+    if not cfg.scoring.escalation_model:
+        return []
     rows = db.q(
-        """SELECT * FROM documents
+        f"""SELECT * FROM documents
             WHERE noul1 IS NOT NULL AND noul2 IS NULL AND skip_reason IS NULL AND part_of IS NULL
-              AND manual IS NULL AND fail_count < ?
-            ORDER BY rowid""", (MAX_FAILS,))
+              AND manual IS NULL AND fail_count < ?{one}
+            ORDER BY rowid""", params)
     return [r for r in rows if decision(r, cfg) == ESCALATE]
+
+
+def stage_model(cfg: Config, stage: str) -> str:
+    return cfg.scoring.escalation_model if stage == "escalate" else cfg.scoring.model or cfg.enrich.model
+
+
+def score_one(db: DB, cfg: Config, scorer: Scorer, row: Row) -> Row:
+    """Ask the decider about one document and store the answer; returns the updated row. A failed request is
+    recorded with the document and re-raised."""
+    sha, stage, model = row["sha256"], scorer.stage, scorer.model
+    t0 = time.monotonic()
+    try:
+        noul, probs, tokens = scorer(row)
+    except OllamaUnavailable:
+        raise
+    except OllamaError as e:
+        db.update_doc(sha, fail_count=row["fail_count"] + 1, last_error=str(e)[:500])
+        db.log_llm(sha, stage, model, time.monotonic() - t0, error=str(e)[:2000])
+        db.commit()
+        raise
+    secs = time.monotonic() - t0
+    if stage == "escalate":
+        db.update_doc(sha, noul2=noul, types2=json.dumps(probs), model2=model, secs2=round(secs, 2), fail_count=0,
+                      last_error=None)
+    else:
+        db.update_doc(sha, noul1=noul, types1=json.dumps(probs), model1=model, secs1=round(secs, 2), fail_count=0,
+                      last_error=None)
+    db.log_llm(sha, stage, model, secs, tokens, 0, json.dumps({"noul": noul, "category": probs}))
+    db.commit()
+    return db.one("SELECT * FROM documents WHERE sha256 = ?", (sha,))
 
 
 def run_scoring(db: DB, cfg: Config, stage: str = "score", limit: int | None = None) -> int:
     """Relevance of new attachments (stage="score") or second opinion on uncertain ones ("escalate")."""
-    if stage == "escalate":
-        model = cfg.scoring.escalation_model
-        if not model:
-            return 0
-    else:
-        model = cfg.scoring.model or cfg.enrich.model
-    rows = _pending(db, cfg, stage)
+    model = stage_model(cfg, stage)
+    rows = pending(db, cfg, stage)
     rows = rows[:limit] if limit else rows
     label = "Escalation" if stage == "escalate" else "Relevance"
     if not rows:
@@ -157,33 +186,21 @@ def run_scoring(db: DB, cfg: Config, stage: str = "score", limit: int | None = N
         progress = Progress(len(rows), label)
         consecutive = 0
         for row in rows:
-            sha = row["sha256"]
             t0 = time.monotonic()
             try:
-                noul, probs, tokens = scorer(row)
+                updated = score_one(db, cfg, scorer, row)
             except OllamaUnavailable:
                 raise
             except OllamaError as e:
-                secs = time.monotonic() - t0
                 consecutive += 1
-                db.update_doc(sha, fail_count=row["fail_count"] + 1, last_error=str(e)[:500])
-                db.log_llm(sha, stage, model, secs, error=str(e)[:2000])
-                db.commit()
-                progress.step(f"{row['filename']}: ERROR {e}", secs)
+                progress.step(f"{row['filename']}: ERROR {e}", time.monotonic() - t0)
                 if consecutive >= MAX_CONSECUTIVE_FAILS:
                     raise OllamaUnavailable(f"{consecutive} errors in a row – stopping. Last error: {e}")
                 continue
             consecutive = 0
-            secs = time.monotonic() - t0
-            if stage == "escalate":
-                db.update_doc(sha, noul2=noul, types2=json.dumps(probs), model2=model, secs2=round(secs, 2))
-            else:
-                db.update_doc(sha, noul1=noul, types1=json.dumps(probs), model1=model, secs1=round(secs, 2))
-            db.log_llm(sha, stage, model, secs, tokens, 0, json.dumps({"noul": noul, "category": probs}))
-            db.commit()
-            updated = db.one("SELECT * FROM documents WHERE sha256 = ?", (sha,))
             p = probability(updated, cfg)
-            progress.step(f"{row['filename']}: {decision(updated, cfg)} ({p:.0%}, {category_key(updated)})", secs)
+            progress.step(f"{row['filename']}: {decision(updated, cfg)} ({p:.0%}, {category_key(updated)})",
+                          time.monotonic() - t0)
         progress.done()
         return len(rows)
     finally:

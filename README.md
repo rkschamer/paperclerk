@@ -9,7 +9,8 @@ those worth keeping. No document leaves your machine and your Paperless server.
   the inbox) and marks them with the tag `paperclerk`.
 - `paperclerk import mbox|imap` reads mail attachments, drops logos, signatures and standard texts such as
   terms and conditions, merges documents that were split across several files, skips what Paperless already
-  has and uploads the rest with the same metadata.
+  has and uploads the rest with the same metadata. In a terminal it opens an import view where you follow
+  every step and decide what is uploaded.
 
 [docs/design.md](docs/design.md) explains how it works and why.
 
@@ -59,15 +60,27 @@ written; type the inbox tag back into the tags to keep a document in the inbox.
 ## Import mail attachments
 
 ```powershell
-uv run paperclerk import mbox "Takeout\Mail\All mail Including Spam and Trash.mbox" --dry-run -n 50
-uv run paperclerk status
-uv run paperclerk review export             # spreadsheet: mark wrong decisions, correct fields
-uv run paperclerk review apply
-uv run paperclerk import mbox "Takeout\Mail\All mail Including Spam and Trash.mbox"   # upload
+uv run paperclerk import mbox "Takeout\Mail\All mail Including Spam and Trash.mbox"
 ```
 
-Every step can be interrupted and resumed; running the same command again continues where it stopped. For
-new mail use `uv run paperclerk import imap` (Gmail app password in `[imap]`).
+This opens the import view, in the same style as `paperclerk ui`. It lists every file found in the mail
+while paperclerk works through the steps in the background: reading the mail, extracting the text, merging
+documents split across several attachments, asking the relevance model whether each one is worth keeping,
+and the metadata model for title, correspondent and so on. The header shows the current step, how far it
+has got and how long the rest will take; the document you are looking at is processed first.
+
+Nothing is uploaded until you accept it. `a` uploads a document with the values in its form, `x` rejects
+it, and `A` uploads every *ready* document but leaves the *uncertain* ones (the relevance model was not
+sure) for you to check (`/uncertain` filters the list). A document the model dropped can still be imported:
+`a` on it asks the model for its metadata first. Enter opens a document with its editable form next to its
+processing steps (which mail it came with, how its text was read, the relevance and category, the decision,
+the metadata, the upload) and its text; `o` opens the file itself. `?` shows all keys.
+
+Your decisions are stored at once. Quit at any time; the same command continues where it stopped. For new
+mail use `uv run paperclerk import imap` (Gmail app password in `[imap]`). When the output is not a
+terminal (e.g. a scheduled task), or with `--dry-run`, `import` runs without the view: `--dry-run` prints
+what would be uploaded, a plain run uploads every relevant document and gives uncertain ones the review tag
+(`paperclerk-review`).
 
 ## Commands
 
@@ -75,10 +88,9 @@ new mail use `uv run paperclerk import imap` (Gmail app password in `[imap]`).
 | --- | --- |
 | `init` | create or convert `config.toml`, download OCR language data |
 | `check` | check configuration, models, Paperless and IMAP |
-| `import mbox FILE...` / `import imap` | import mail attachments (`--dry-run`, `-n N`) |
+| `import mbox FILE...` / `import imap` | import mail attachments; in a terminal in the import view (`--dry-run`, `-n N`) |
 | `process` | enrich unprocessed Paperless documents (`--dry-run`, `-n N`) |
 | `ui` | check, edit and accept the suggestions of `process` in a terminal UI |
-| `review export` / `review apply [FILE]` | check and correct import results in a spreadsheet |
 | `status` | progress of imports and processing |
 | `show ID` | an imported document (hash prefix) or a processed Paperless document (number) |
 
@@ -89,5 +101,5 @@ $env:PAPERCLERK_TEST_TESSDATA = "D:\git\process-mail-documents\data\tessdata"   
 uv run pytest
 ```
 
-The tests build an mbox with German sample documents (`tests/samples.py`) and run the import and `process`
-against fake Ollama and Paperless servers (API v10).
+The tests build an mbox with German sample documents (`tests/samples.py`) and run the import, `process` and
+both terminal UIs against fake Ollama and Paperless servers (API v10).

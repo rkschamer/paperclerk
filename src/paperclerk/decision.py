@@ -7,6 +7,7 @@ effect immediately without asking the models again.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any, Mapping
 
 from .config import Config
@@ -88,3 +89,54 @@ def effective(row: Row, name: str) -> Any:
         return over[name]
     value = meta(row).get(name)
     return value if value is not None else _EMPTY.get(name, str)()
+
+
+# ---------------------------------------------------------------- where an imported document stands
+
+SKIPPED, NEW, PART = "skipped", "new", "part"
+
+
+def state(row: Row, cfg: Config) -> str:
+    if row["part_of"]:
+        return PART
+    if row["skip_reason"]:
+        return SKIPPED
+    if row["text_method"] is None:
+        return NEW
+    return decision(row, cfg)
+
+
+def evaluate(db, cfg: Config) -> str:
+    """How the thresholds perform against the user's decisions (manual yes/no), as a text report."""
+    labeled = db.q("SELECT * FROM documents WHERE manual IN ('yes', 'no') AND noul1 IS NOT NULL")
+    if not labeled:
+        return ""
+    every = db.q("SELECT * FROM documents WHERE noul1 IS NOT NULL AND skip_reason IS NULL AND part_of IS NULL")
+    out: list[str] = []
+    variants = [(f"Relevance ({labeled[0]['model1']})", lambda r: relevance(r["noul1"], r["types1"], cfg))]
+    if any(r["noul2"] is not None for r in labeled):
+        variants.append(("Relevance + escalation", lambda r: probability(r, cfg)))
+    for name, fn in variants:
+        pos = [fn(r) for r in labeled if r["manual"] == "yes"]
+        neg = [fn(r) for r in labeled if r["manual"] == "no"]
+        ps = [fn(r) for r in every]
+        out += ["", f"== {name}: you imported {len(pos)}, rejected {len(neg)} =="]
+        out.append("reject <= t:  share of all documents skipped | imported ones that would be skipped")
+        for t in (0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5):
+            mark = "  <- current" if abs(t - cfg.scoring.reject) < 1e-9 else ""
+            out.append(f"  {t:4.2f}:  {sum(p <= t for p in ps) / len(ps):6.1%}  |  {sum(p <= t for p in pos)}/"
+                       f"{len(pos)}{mark}")
+        out.append("accept >= t:  share of all documents imported | rejected ones that would be imported")
+        for t in (0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95):
+            mark = "  <- current" if abs(t - cfg.scoring.accept) < 1e-9 else ""
+            out.append(f"  {t:4.2f}:  {sum(p >= t for p in ps) / len(ps):6.1%}  |  {sum(p >= t for p in neg)}/"
+                       f"{len(neg)}{mark}")
+    matrix = Counter((r["manual"], decision(r, cfg, use_manual=False)) for r in labeled)
+    out += ["", "== The model's decision vs. yours =="]
+    for manual, label in (("yes", "imported"), ("no", "rejected")):
+        parts = ", ".join(f"{d}: {matrix[(manual, d)]}" for d in (RELEVANT, REVIEW, ESCALATE, IRRELEVANT))
+        out.append(f"  you {label:<8} -> {parts}")
+    wrong = [r for r in labeled if r["manual"] == "yes" and decision(r, cfg, use_manual=False) == IRRELEVANT]
+    if wrong:
+        out.append("Wrongly skipped: " + ", ".join(f"{r['sha256'][:12]} ({r['filename']})" for r in wrong[:20]))
+    return "\n".join(out).strip("\n")

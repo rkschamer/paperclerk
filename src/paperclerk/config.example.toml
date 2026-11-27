@@ -88,7 +88,8 @@ remove_inbox_tags = true
 [import]
 # Tags for imported documents, in addition to the processed tag and the content tags
 tags = ["mail-import"]
-# Added to imported documents whose relevance is uncertain
+# Added to documents of uncertain relevance that an unattended import uploads (in the import view you
+# decide about them, so accepting one does not add it)
 review_tag = "paperclerk-review"
 # File kinds to import; "office" (docx, xlsx, odt, ...) needs Tika/Gotenberg in Paperless
 kinds = ["pdf", "image"]
@@ -112,9 +113,10 @@ max_pending = 8
 # pplx-decider-flash (4B) only exists as an MLX build (Apple Silicon); on a Mac use
 # model = "pplx-decider-flash" and escalation_model = "pplx-decider".
 model = "pplx-decider"
-# Uncertain cases (between reject and accept) go to this model; "" = no escalation, they get the review tag
+# Uncertain cases (between reject and accept) go to this model; "" = no escalation, they stay uncertain
 escalation_model = ""
-# relevance >= accept: import; <= reject: skip; in between: escalate or import with the review tag
+# relevance >= accept: import; <= reject: skip; in between: escalate, then uncertain (you decide in the
+# import view; an unattended import uploads them with the review tag)
 accept = 0.75
 reject = 0.15
 # relevance = (1 - type_weight) * yes/no answer + type_weight * probability of all relevant categories

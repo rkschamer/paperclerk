@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import time
 
+from textual import events
+from textual.widgets._toast import Toast
+
 from paperclerk.draft import Draft, changes_for, current, merge, proposal
 from paperclerk.paperless import Registry
 from paperclerk.ui import Confirm, DocScreen, Help, Jobs, ProcessApp, help_text
@@ -97,9 +100,9 @@ def test_jobs_prefer_the_document_on_screen():
 
 # ---------------------------------------------------------------- the app
 
-def run(app: ProcessApp, steps, size=(160, 48)):
+def run(app: ProcessApp, steps, size=(160, 48), notifications=False):
     async def main():
-        async with app.run_test(size=size) as pilot:
+        async with app.run_test(size=size, notifications=notifications) as pilot:
             await steps(pilot)
     asyncio.run(main())
 
@@ -332,3 +335,25 @@ def test_small_terminal_help_and_text_only(db, cfg, fake_ollama, fake_paperless)
         assert app.screen is app.list_screen
 
     run(app, steps, size=(100, 30))
+
+
+def test_a_toast_that_is_gone_does_not_crash_the_ui(db, cfg, fake_ollama, fake_paperless, caplog):
+    """A second click on a dismissed toast (or a toast timing out under the mouse) used to crash Textual."""
+    _setup(fake_paperless)
+    app = ProcessApp(cfg)
+
+    async def steps(pilot):
+        await until(pilot, _ready(app))
+        app.notify("Paperless unreachable", title="Paperless", severity="error", timeout=30)
+        await until(pilot, lambda: app.screen.query(Toast) and app.screen.query(Toast).first().region.width)
+        toast = app.screen.query(Toast).first()
+        x, y = toast.region.x + 2, toast.region.y + 1
+        await toast.parent.remove()  # as the first click does; the last frame still shows it
+        await app.on_event(events.MouseDown(None, x, y, 0, 0, 1, False, False, False, screen_x=x, screen_y=y))
+        await pilot.pause()
+        assert app.is_running
+
+    run(app, steps, notifications=True)
+    logged = [r for r in caplog.records if "Paperless unreachable" in r.getMessage()]
+    assert len(logged) == 1 and logged[0].levelname == "ERROR"  # in the log file too, once
+    assert logged[0].getMessage() == "Paperless: Paperless unreachable"
